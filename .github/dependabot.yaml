@@ -17,7 +17,7 @@ updates:
     schedule:
       interval: weekly
   - package-ecosystem: docker
-    directory: codex-cli
+    directory: apps/codex-cli
     schedule:
       interval: weekly
   - package-ecosystem: github-actions
