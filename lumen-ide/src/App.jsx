@@ -1,11 +1,11 @@
-import React, { useEffect, useState } from "react";
+﻿import React, { useEffect, useState } from "react";
 import styled, { keyframes } from "styled-components";
 import TopBar from "./components/TopBar";
 import SettingsModal from "./components/SettingsModal";
 import ExplorerPanel from "./panels/ExplorerPanel";
 import NyxConsole from "./panels/NyxConsole";
 import MonacoEditor from "./editor/MonacoEditor";
-import { sendToNyx } from "./services/nyxService";
+import { sendToNyx, receiveSuggestions } from "./services/nyxService";
 
 const fadeIn = keyframes`
   from {
@@ -102,8 +102,11 @@ const EditorPanel = styled(Panel)`
 `;
 
 export default function App() {
-  const [code, setCode] = useState("// Welcome to Lumen IDE\n// Nyx will offer AI suggestions here.\n");
-  const [nyxData, setNyxData] = useState(null);
+  const [code, setCode] = useState(
+    "// Welcome to Lumen IDE\n// Nyx will offer AI suggestions here.\n"
+  );
+  const [nyxStatus, setNyxStatus] = useState("idle");
+  const [nyxPayload, setNyxPayload] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState(null);
 
@@ -122,10 +125,12 @@ export default function App() {
     };
   }, []);
 
-  const handleSendNyx = async () => {
-    // Send editor content to Nyx (placeholder response for now).
-    const response = await sendToNyx(code);
-    setNyxData(response);
+  const handleSendNyx = async ({ prompt, model, reasoningEffort }) => {
+    setNyxStatus("thinking");
+    const response = await sendToNyx(code, prompt, { model, reasoningEffort });
+    const suggestions = await receiveSuggestions();
+    setNyxPayload({ response, suggestions });
+    setNyxStatus("ready");
   };
 
   const handleSaveSettings = async (nextSettings) => {
@@ -147,7 +152,7 @@ export default function App() {
           <MonacoEditor value={code} onChange={setCode} />
         </EditorPanel>
         <Panel style={{ gridArea: "nyx", "--panel-delay": "180ms" }}>
-          <NyxConsole nyxData={nyxData} onSend={handleSendNyx} />
+          <NyxConsole status={nyxStatus} payload={nyxPayload} onSend={handleSendNyx} />
         </Panel>
       </Body>
       {settingsOpen && (
