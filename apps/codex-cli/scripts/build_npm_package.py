@@ -11,9 +11,9 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CODEX_CLI_ROOT = SCRIPT_DIR.parent
-REPO_ROOT = CODEX_CLI_ROOT.parent
+REPO_ROOT = CODEX_CLI_ROOT.parent.parent
 RESPONSES_API_PROXY_NPM_ROOT = REPO_ROOT / "codex-rs" / "responses-api-proxy" / "npm"
-CODEX_SDK_ROOT = REPO_ROOT / "sdk" / "typescript"
+CODEX_SDK_ROOT = REPO_ROOT / "packages" / "sdk" / "typescript"
 
 PACKAGE_NATIVE_COMPONENTS: dict[str, list[str]] = {
     "codex": ["codex", "rg"],

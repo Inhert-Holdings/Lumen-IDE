@@ -17,7 +17,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/openai/codex.git",
-    "directory": "shell-tool-mcp"
+    "directory": "apps/shell-tool-mcp"
   },
   "scripts": {
     "clean": "rm -rf bin",
