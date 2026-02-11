@@ -17,11 +17,11 @@ importers:
         specifier: ^3.5.3
         version: 3.5.3
 
-  codex-cli: {}
+  apps/codex-cli: {}
 
   codex-rs/responses-api-proxy/npm: {}
 
-  sdk/typescript:
+  packages/sdk/typescript:
     devDependencies:
       '@modelcontextprotocol/sdk':
         specifier: ^1.24.0
@@ -75,7 +75,7 @@ importers:
         specifier: ^3.24.6
         version: 3.24.6(zod@3.25.76)
 
-  shell-tool-mcp:
+  apps/shell-tool-mcp:
     devDependencies:
       '@types/jest':
         specifier: ^29.5.14
