@@ -61,6 +61,16 @@ const isWithinWorkspace = (targetPath, workspaceRoot) => {
   return resolved === workspaceRoot || resolved.startsWith(`${workspaceRoot}${path.sep}`);
 };
 
+const resolveWorkspacePath = (inputPath, workspaceRoot) => {
+  if (!inputPath) return null;
+  const trimmed = String(inputPath).trim();
+  if (!trimmed) return null;
+  const resolved = path.isAbsolute(trimmed)
+    ? path.resolve(trimmed)
+    : path.resolve(workspaceRoot, trimmed);
+  return resolved;
+};
+
 const shouldSkipEntry = (entry) => {
   if (!entry) return true;
   if (entry.isDirectory()) {
@@ -133,18 +143,19 @@ const listWorkspaceTool = ({ max_depth: maxDepth = 4 } = {}) => {
 
 const readWorkspaceFileTool = ({ path: filePath } = {}) => {
   const workspaceRoot = loadWorkspaceRoot();
-  if (!filePath || !isWithinWorkspace(filePath, workspaceRoot)) {
+  const resolvedPath = resolveWorkspacePath(filePath, workspaceRoot);
+  if (!resolvedPath || !isWithinWorkspace(resolvedPath, workspaceRoot)) {
     return { status: 'error', message: 'File is outside the workspace root.' };
   }
 
-  const fileName = path.basename(filePath);
+  const fileName = path.basename(resolvedPath);
   if (EXCLUDED_FILES.has(fileName)) {
     return { status: 'error', message: 'This file is restricted.' };
   }
 
   let stat;
   try {
-    stat = fs.statSync(filePath);
+    stat = fs.statSync(resolvedPath);
   } catch {
     return { status: 'error', message: 'File not found.' };
   }
@@ -158,10 +169,45 @@ const readWorkspaceFileTool = ({ path: filePath } = {}) => {
   }
 
   try {
-    const content = fs.readFileSync(filePath, 'utf8');
-    return { status: 'ok', path: filePath, content };
+    const content = fs.readFileSync(resolvedPath, 'utf8');
+    return { status: 'ok', path: resolvedPath, content };
   } catch {
     return { status: 'error', message: 'Unable to read file.' };
+  }
+};
+
+const deleteWorkspaceFileTool = ({ path: filePath } = {}, allowWrite = false) => {
+  if (!allowWrite) {
+    return { status: 'error', message: 'Delete access is disabled. Enable file edits to delete files.' };
+  }
+
+  const workspaceRoot = loadWorkspaceRoot();
+  const resolvedPath = resolveWorkspacePath(filePath, workspaceRoot);
+  if (!resolvedPath || !isWithinWorkspace(resolvedPath, workspaceRoot)) {
+    return { status: 'error', message: 'File is outside the workspace root.' };
+  }
+
+  const fileName = path.basename(resolvedPath);
+  if (EXCLUDED_FILES.has(fileName)) {
+    return { status: 'error', message: 'This file is restricted.' };
+  }
+
+  let stat;
+  try {
+    stat = fs.statSync(resolvedPath);
+  } catch {
+    return { status: 'error', message: 'File not found.' };
+  }
+
+  if (!stat.isFile()) {
+    return { status: 'error', message: 'Path is not a file.' };
+  }
+
+  try {
+    fs.unlinkSync(resolvedPath);
+    return { status: 'ok', path: resolvedPath };
+  } catch {
+    return { status: 'error', message: 'Unable to delete file.' };
   }
 };
 
@@ -171,11 +217,12 @@ const writeWorkspaceFileTool = ({ path: filePath, content } = {}, allowWrite = f
   }
 
   const workspaceRoot = loadWorkspaceRoot();
-  if (!filePath || !isWithinWorkspace(filePath, workspaceRoot)) {
+  const resolvedPath = resolveWorkspacePath(filePath, workspaceRoot);
+  if (!resolvedPath || !isWithinWorkspace(resolvedPath, workspaceRoot)) {
     return { status: 'error', message: 'File is outside the workspace root.' };
   }
 
-  const fileName = path.basename(filePath);
+  const fileName = path.basename(resolvedPath);
   if (EXCLUDED_FILES.has(fileName)) {
     return { status: 'error', message: 'This file is restricted.' };
   }
@@ -185,9 +232,9 @@ const writeWorkspaceFileTool = ({ path: filePath, content } = {}, allowWrite = f
   }
 
   try {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, content, 'utf8');
-    return { status: 'ok', path: filePath, bytes: Buffer.byteLength(content, 'utf8') };
+    fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
+    fs.writeFileSync(resolvedPath, content, 'utf8');
+    return { status: 'ok', path: resolvedPath, bytes: Buffer.byteLength(content, 'utf8') };
   } catch {
     return { status: 'error', message: 'Unable to write file.' };
   }
@@ -531,6 +578,18 @@ const buildTools = ({ allowWrite } = {}) => {
         required: ['path', 'content']
       }
     });
+    tools.push({
+      type: 'function',
+      name: 'delete_file',
+      description: 'Delete a file from the workspace.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' }
+        },
+        required: ['path']
+      }
+    });
   }
 
   return tools;
@@ -559,6 +618,8 @@ const executeToolCall = (call, allowWrite) => {
       return searchWorkspaceTool(args);
     case 'write_file':
       return writeWorkspaceFileTool(args, allowWrite);
+    case 'delete_file':
+      return deleteWorkspaceFileTool(args, allowWrite);
     default:
       return { status: 'error', message: `Unknown tool: ${name}` };
   }
@@ -650,7 +711,7 @@ const sendToNyx = async (payload = '') => {
         {
           role: 'system',
           content:
-            'You are Nyx, the internal AI engine for Lumen IDE. Provide crisp, actionable guidance based on workspace data. Use tools to inspect files instead of guessing. If suggesting code, keep it concise and explain why. Avoid placeholder paths, fake citations, or line markers (no <replace_with_actual_path>, no F:, no +L1-L2). If you need to reference the file, say "the current file" instead. If write_file is unavailable, ask the user to enable file edits before proposing changes.'
+            'You are Nyx, the internal AI engine for Lumen IDE. Provide crisp, actionable guidance based on workspace data. Use tools to inspect files instead of guessing. If suggesting code, keep it concise and explain why. Avoid placeholder paths, fake citations, or line markers (no <replace_with_actual_path>, no F:, no +L1-L2). If you need to reference the file, say "the current file" instead. If write_file is unavailable, ask the user to enable file edits before proposing changes. When calling tools, you may use paths relative to the workspace root.'
         },
         {
           role: 'user',
