@@ -99,6 +99,24 @@ const Panel = styled.section`
 
 const EditorPanel = styled(Panel)`
   padding: 8px;
+  gap: 8px;
+`;
+
+const EditorHeader = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  background: rgba(7, 9, 13, 0.7);
+  color: var(--text-muted);
+  font-size: 12px;
+`;
+
+const FilePath = styled.span`
+  color: var(--text-primary);
+  font-size: 12px;
 `;
 
 export default function App() {
@@ -109,6 +127,7 @@ export default function App() {
   const [nyxPayload, setNyxPayload] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState(null);
+  const [activeFile, setActiveFile] = useState("");
 
   useEffect(() => {
     // Load persisted settings via the Electron main process (placeholder storage).
@@ -125,12 +144,23 @@ export default function App() {
     };
   }, []);
 
-  const handleSendNyx = async ({ prompt, model, reasoningEffort }) => {
+  const handleSendNyx = async ({ prompt, model, reasoningEffort, allowWrite }) => {
     setNyxStatus("thinking");
-    const response = await sendToNyx(code, prompt, { model, reasoningEffort });
+    const response = await sendToNyx(code, prompt, {
+      model,
+      reasoningEffort,
+      filePath: activeFile,
+      allowWrite
+    });
     const suggestions = await receiveSuggestions();
     setNyxPayload({ response, suggestions });
     setNyxStatus("ready");
+  };
+
+  const handleOpenFile = ({ path, content }) => {
+    if (!path || typeof content !== "string") return;
+    setActiveFile(path);
+    setCode(content);
   };
 
   const handleSaveSettings = async (nextSettings) => {
@@ -146,9 +176,13 @@ export default function App() {
       <TopBar onOpenSettings={() => setSettingsOpen(true)} />
       <Body>
         <Panel style={{ gridArea: "explorer", "--panel-delay": "60ms" }}>
-          <ExplorerPanel />
+          <ExplorerPanel activeFile={activeFile} onOpenFile={handleOpenFile} />
         </Panel>
         <EditorPanel style={{ gridArea: "editor", "--panel-delay": "120ms" }}>
+          <EditorHeader>
+            <span>Editor</span>
+            <FilePath>{activeFile || "No file loaded"}</FilePath>
+          </EditorHeader>
           <MonacoEditor value={code} onChange={setCode} />
         </EditorPanel>
         <Panel style={{ gridArea: "nyx", "--panel-delay": "180ms" }}>
