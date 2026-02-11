@@ -49,9 +49,14 @@ Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your 
 
 You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
 
+## Repository layout
+
+This repo is a monorepo. See [Repository layout](./docs/repo-layout.md) for a map of top-level folders and key entry points.
+
 ## Docs
 
 - [**Codex Documentation**](https://developers.openai.com/codex)
+- [**Repository layout**](./docs/repo-layout.md)
 - [**Contributing**](./docs/contributing.md)
 - [**Installing & building**](./docs/install.md)
 - [**Open source fund**](./docs/open-source-fund.md)
