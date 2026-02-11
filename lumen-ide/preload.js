@@ -1,9 +1,12 @@
-const { contextBridge, ipcRenderer } = require("electron");
+﻿const { contextBridge, ipcRenderer } = require("electron");
 
 // Secure IPC surface for Nyx + settings (placeholder until full API hardening).
 contextBridge.exposeInMainWorld("lumen", {
   nyx: {
-    sendToNyx: (content) => ipcRenderer.invoke("nyx:send", { content })
+    send: (payload) => ipcRenderer.invoke("nyx:send", payload),
+    suggestions: () => ipcRenderer.invoke("nyx:suggestions"),
+    // Back-compat for older renderer calls.
+    sendToNyx: (content) => ipcRenderer.invoke("nyx:send", { fileContent: content })
   },
   settings: {
     load: () => ipcRenderer.invoke("settings:load"),

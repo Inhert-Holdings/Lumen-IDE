@@ -1,6 +1,10 @@
-const { app, BrowserWindow, ipcMain } = require("electron");
-const path = require("path");
+﻿const path = require("path");
 const fs = require("fs");
+
+require("dotenv").config({ path: path.join(__dirname, ".env") });
+
+const { app, BrowserWindow, ipcMain } = require("electron");
+const { sendToNyx, receiveSuggestions } = require("./backend/nyxService");
 
 const SETTINGS_FILE = "lumen-settings.enc.json";
 const USER_DATA_DIR = path.join(__dirname, ".lumen-user");
@@ -53,18 +57,11 @@ async function createWindow() {
 }
 
 ipcMain.handle("nyx:send", async (_event, payload) => {
-  // Placeholder response until Nyx is implemented.
-  return {
-    status: "ok",
-    receivedBytes: payload?.content?.length || 0,
-    summary: "Nyx placeholder response: analysis queued.",
-    suggestions: [
-      "Refactor this module into smaller units.",
-      "Add tests around the main workflow.",
-      "Document public APIs before release."
-    ],
-    timestamp: new Date().toISOString()
-  };
+  return sendToNyx(payload);
+});
+
+ipcMain.handle("nyx:suggestions", async () => {
+  return receiveSuggestions();
 });
 
 ipcMain.handle("settings:load", async () => {

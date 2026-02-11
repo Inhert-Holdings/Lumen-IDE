@@ -1,18 +1,30 @@
-export async function sendToNyx(fileContent) {
-  // Placeholder until Nyx is wired to a real backend / IPC channel.
-  if (window?.lumen?.nyx?.sendToNyx) {
-    return window.lumen.nyx.sendToNyx(fileContent);
+﻿export async function sendToNyx(
+  fileContent,
+  prompt = '',
+  { model = 'auto', reasoningEffort = 'auto' } = {}
+) {
+  if (window?.lumen?.nyx?.send) {
+    return window.lumen.nyx.send({
+      fileContent,
+      prompt,
+      model,
+      reasoningEffort
+    });
   }
 
   return {
-    status: "offline",
-    summary: "Nyx placeholder response (renderer fallback).",
-    suggestions: ["Connect Nyx backend to enable AI insights."],
-    timestamp: new Date().toISOString()
+    status: 'offline',
+    message: 'Nyx bridge not available. Run via Electron to use live inference.'
   };
 }
 
-export function receiveSuggestions() {
-  // Placeholder polling hook for future real-time suggestions.
-  return "Nyx suggestions will appear here.";
+export async function receiveSuggestions() {
+  if (window?.lumen?.nyx?.suggestions) {
+    return window.lumen.nyx.suggestions();
+  }
+
+  return {
+    status: 'offline',
+    suggestions: ['Launch via Electron to unlock Nyx placeholders.']
+  };
 }
