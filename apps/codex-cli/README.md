@@ -6,7 +6,7 @@
 > [!IMPORTANT]
 > This is the documentation for the _legacy_ TypeScript implementation of the Codex CLI. It has been superseded by the _Rust_ implementation. See the [README in the root of the Codex repository](https://github.com/openai/codex/blob/main/README.md) for details.
 
-![Codex demo GIF using: codex "explain this codebase to me"](../.github/demo.gif)
+![Codex demo GIF using: codex "explain this codebase to me"](../../.github/demo.gif)
 
 ---
 
@@ -199,7 +199,7 @@ The hardening mechanism Codex uses depends on your OS:
   container image** and mounts your repo _read/write_ at the same path. A
   custom `iptables`/`ipset` firewall script denies all egress except the
   OpenAI API. This gives you deterministic, reproducible runs without needing
-  root on the host. You can use the [`run_in_container.sh`](../codex-cli/scripts/run_in_container.sh) script to set up the sandbox.
+  root on the host. You can use the [`run_in_container.sh`](./scripts/run_in_container.sh) script to set up the sandbox.
 
 ---
 
@@ -267,7 +267,7 @@ DEBUG=true codex
 
 ## Recipes
 
-Below are a few bite-size examples you can copy-paste. Replace the text in quotes with your own task. See the [prompting guide](https://github.com/openai/codex/blob/main/codex-cli/examples/prompting_guide.md) for more tips and usage patterns.
+Below are a few bite-size examples you can copy-paste. Replace the text in quotes with your own task. See the [prompting guide](https://github.com/openai/codex/blob/main/apps/codex-cli/examples/prompting_guide.md) for more tips and usage patterns.
 
 | ✨  | What you type                                                                   | What happens                                                               |
 | --- | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
@@ -304,7 +304,7 @@ pnpm add -g @openai/codex
 ```bash
 # Clone the repository and navigate to the CLI package
 git clone https://github.com/openai/codex.git
-cd codex/codex-cli
+cd codex/apps/codex-cli
 
 # Enable corepack
 corepack enable
@@ -591,7 +591,7 @@ pnpm format:fix
 
 ### Debugging
 
-To debug the CLI with a visual debugger, do the following in the `codex-cli` folder:
+To debug the CLI with a visual debugger, do the following in the `apps/codex-cli` folder:
 
 - Run `pnpm run build` to build the CLI, which will generate `cli.js.map` alongside `cli.js` in the `dist` folder.
 - Run the CLI with `node --inspect-brk ./dist/cli.js` The program then waits until a debugger is attached before proceeding. Options:
@@ -656,8 +656,8 @@ The **DCO check** blocks merges until every commit in the PR carries the footer 
 ### Releasing `codex`
 
 To publish a new version of the CLI you first need to stage the npm package. A
-helper script in `codex-cli/scripts/` does all the heavy lifting. Inside the
-`codex-cli` folder run:
+helper script in `apps/codex-cli/scripts/` does all the heavy lifting. Inside the
+`apps/codex-cli` folder run:
 
 ```bash
 # Classic, JS implementation that includes small, native binaries for Linux sandboxing.
@@ -718,9 +718,9 @@ If you have direnv installed, you can use the following `.envrc` to automaticall
 
 ```bash
 cd codex-rs
-echo "use flake ../flake.nix#codex-cli" >> .envrc && direnv allow
-cd codex-cli
-echo "use flake ../flake.nix#codex-rs" >> .envrc && direnv allow
+echo "use flake ../../flake.nix#codex-cli" >> .envrc && direnv allow
+cd apps/codex-cli
+echo "use flake ../../flake.nix#codex-rs" >> .envrc && direnv allow
 ```
 
 ---
@@ -733,4 +733,4 @@ Have you discovered a vulnerability or have concerns about model output? Please 
 
 ## License
 
-This repository is licensed under the [Apache-2.0 License](LICENSE).
+This repository is licensed under the [Apache-2.0 License](../../LICENSE).

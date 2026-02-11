@@ -270,7 +270,7 @@ jobs:
           cd /tmp/bash
           git fetch --depth 1 origin a8a1c2fac029404d3f42cd39f5a20f24b6e4fe4b
           git checkout a8a1c2fac029404d3f42cd39f5a20f24b6e4fe4b
-          git apply "${GITHUB_WORKSPACE}/shell-tool-mcp/patches/bash-exec-wrapper.patch"
+          git apply "${GITHUB_WORKSPACE}/apps/shell-tool-mcp/patches/bash-exec-wrapper.patch"
           ./configure --without-bash-malloc
           cores="$(command -v nproc >/dev/null 2>&1 && nproc || getconf _NPROCESSORS_ONLN)"
           make -j"${cores}"
@@ -312,7 +312,7 @@ jobs:
           cd /tmp/bash
           git fetch --depth 1 origin a8a1c2fac029404d3f42cd39f5a20f24b6e4fe4b
           git checkout a8a1c2fac029404d3f42cd39f5a20f24b6e4fe4b
-          git apply "${GITHUB_WORKSPACE}/shell-tool-mcp/patches/bash-exec-wrapper.patch"
+          git apply "${GITHUB_WORKSPACE}/apps/shell-tool-mcp/patches/bash-exec-wrapper.patch"
           ./configure --without-bash-malloc
           cores="$(getconf _NPROCESSORS_ONLN)"
           make -j"${cores}"
@@ -369,9 +369,9 @@ jobs:
           set -euo pipefail
           staging="${STAGING_DIR}"
           mkdir -p "$staging" "$staging/vendor"
-          cp shell-tool-mcp/README.md "$staging/"
-          cp shell-tool-mcp/package.json "$staging/"
-          cp -R shell-tool-mcp/bin "$staging/"
+          cp apps/shell-tool-mcp/README.md "$staging/"
+          cp apps/shell-tool-mcp/package.json "$staging/"
+          cp -R apps/shell-tool-mcp/bin "$staging/"
 
           found_vendor="false"
           shopt -s nullglob
