@@ -1,0 +1,58 @@
+{
+  "name": "lumen-ide",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lumen IDE - AI-first desktop IDE powered by Nyx.",
+  "main": "main.js",
+  "author": "Inhert Holdings",
+  "license": "Apache-2.0",
+  "scripts": {
+    "start": "concurrently \"npm:renderer\" \"npm:electron\"",
+    "renderer": "vite",
+    "electron": "wait-on tcp:5173 && node scripts/launch-electron.js",
+    "renderer:build": "vite build",
+    "build": "npm run renderer:build && electron-builder",
+    "package": "npm run build"
+  },
+  "dependencies": {
+    "@monaco-editor/react": "^4.7.0",
+    "dotenv": "^16.4.5",
+    "monaco-editor": "^0.49.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "styled-components": "^6.1.12"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "concurrently": "^9.0.1",
+    "cross-env": "^7.0.3",
+    "electron": "^30.1.0",
+    "electron-builder": "^24.13.3",
+    "vite": "^5.4.0",
+    "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "com.inhert.lumenide",
+    "productName": "Lumen IDE",
+    "files": [
+      "dist/**/*",
+      "main.js",
+      "preload.js",
+      "package.json"
+    ],
+    "directories": {
+      "buildResources": "assets",
+      "output": "release"
+    },
+    "mac": {
+      "category": "public.app-category.developer-tools"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Development"
+    }
+  }
+}
