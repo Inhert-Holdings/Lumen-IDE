@@ -501,9 +501,7 @@ const buildPrompt = ({ fileContent, prompt, filePath, workspaceRoot, mode, allow
   const { text, truncated } = truncateContent(normalizedContent, 12000);
 
   const notes = truncated
-    ? '
-
-[Note: File content truncated for context. Request full file if needed.]'
+    ? '\\n\\n[Note: File content truncated for context. Request full file if needed.]'
     : '';
 
   const header = [];
@@ -513,23 +511,13 @@ const buildPrompt = ({ fileContent, prompt, filePath, workspaceRoot, mode, allow
   const modeHint = MODE_INSTRUCTIONS[mode] || '';
   const modeLine = mode ? `Mode: ${mode}` : '';
   const writeLine = allowWrite ? 'Write access: enabled.' : 'Write access: disabled.';
-  const modeBlock = modeHint ? `${modeLine}
-${writeLine}
-Guidance: ${modeHint}
+  const modeBlock = modeHint ? `${modeLine}\\n${writeLine}\\nGuidance: ${modeHint}\\n\\n` : '';
 
-` : '';
+  const headerText = header.length ? `${header.join('\\n')}\\n\\n` : '';
 
-  const headerText = header.length ? `${header.join('
-')}
-
-` : '';
-
-  return `${headerText}${modeBlock}Task: ${task}
-
-File content:
-
-${text}${notes}`.trim();
+  return `${headerText}${modeBlock}Task: ${task}\\n\\nFile content:\\n\\n${text}${notes}`.trim();
 };
+
 const determineReasoningEffort = (model, tier) => {
   if (!model || !model.startsWith('gpt-5')) {
     return undefined;
