@@ -16,4 +16,11 @@
     // `args` for an MCP server is significant, so we disable reordering.
     "evenBetterToml.formatter.reorderArrays": false,
     "evenBetterToml.formatter.reorderKeys": true,
+    "explorer.fileNesting.enabled": true,
+    "explorer.fileNesting.patterns": {
+        "BUILD.bazel": ".bazelignore, .bazelrc, .bazelversion, MODULE.bazel, MODULE.bazel.lock, *.bzl",
+        "package.json": "pnpm-lock.yaml, pnpm-workspace.yaml, .npmrc, .prettierrc.toml, .prettierignore, .markdownlint-cli2.yaml, .codespellrc, .codespellignore",
+        "README.md": "CHANGELOG.md, LICENSE, NOTICE",
+        "flake.nix": "flake.lock"
+    }
 }
