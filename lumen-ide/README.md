@@ -9,6 +9,14 @@ cd lumen-ide
 npm install
 ```
 
+Create a local env file for Nyx:
+
+```bash
+# PowerShell
+Copy-Item .env.example .env
+# then edit .env and set OPENAI_API_KEY
+```
+
 ## Run locally (dev)
 
 ```bash
