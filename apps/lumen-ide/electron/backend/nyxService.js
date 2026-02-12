@@ -486,24 +486,50 @@ const truncateContent = (content, maxChars) => {
   };
 };
 
-const buildPrompt = ({ fileContent, prompt, filePath, workspaceRoot }) => {
+const MODE_INSTRUCTIONS = {
+  review: 'Review the current file for improvements. Focus on clarity, correctness, and maintainability.',
+  refactor:
+    'Refactor the current file for clarity and performance. Provide a step-by-step plan. If write access is enabled, apply changes with write_file; otherwise propose a diff and ask for approval.',
+  tests: 'Generate tests for the current file with coverage for core behavior and edge cases.',
+  explain: 'Explain what this file does and how its key flows work.',
+  fix: 'Identify likely bugs or risks and propose concrete fixes.'
+};
+
+const buildPrompt = ({ fileContent, prompt, filePath, workspaceRoot, mode, allowWrite }) => {
   const task = normalizeText(prompt) || 'Review this file and provide the best improvements.';
   const normalizedContent = normalizeText(fileContent);
   const { text, truncated } = truncateContent(normalizedContent, 12000);
 
   const notes = truncated
-    ? '\n\n[Note: File content truncated for context. Request full file if needed.]'
+    ? '
+
+[Note: File content truncated for context. Request full file if needed.]'
     : '';
 
   const header = [];
   if (workspaceRoot) header.push(`Workspace root: ${workspaceRoot}`);
   if (filePath) header.push(`Current file: ${filePath}`);
 
-  const headerText = header.length ? `${header.join('\n')}\n\n` : '';
+  const modeHint = MODE_INSTRUCTIONS[mode] || '';
+  const modeLine = mode ? `Mode: ${mode}` : '';
+  const writeLine = allowWrite ? 'Write access: enabled.' : 'Write access: disabled.';
+  const modeBlock = modeHint ? `${modeLine}
+${writeLine}
+Guidance: ${modeHint}
 
-  return `${headerText}Task: ${task}\n\nFile content:\n\n${text}${notes}`.trim();
+` : '';
+
+  const headerText = header.length ? `${header.join('
+')}
+
+` : '';
+
+  return `${headerText}${modeBlock}Task: ${task}
+
+File content:
+
+${text}${notes}`.trim();
 };
-
 const determineReasoningEffort = (model, tier) => {
   if (!model || !model.startsWith('gpt-5')) {
     return undefined;
@@ -662,7 +688,8 @@ const sendToNyx = async (payload = '') => {
     model: requestedModel,
     reasoningEffort: requestedReasoning,
     filePath,
-    allowWrite
+    allowWrite,
+    mode
   } =
     typeof payload === 'string'
       ? {
@@ -671,7 +698,8 @@ const sendToNyx = async (payload = '') => {
           model: 'auto',
           reasoningEffort: 'auto',
           filePath: '',
-          allowWrite: false
+          allowWrite: false,
+          mode: 'review'
         }
       : {
           fileContent: payload.fileContent || '',
@@ -679,7 +707,8 @@ const sendToNyx = async (payload = '') => {
           model: payload.model || 'auto',
           reasoningEffort: payload.reasoningEffort || 'auto',
           filePath: payload.filePath || '',
-          allowWrite: Boolean(payload.allowWrite)
+          allowWrite: Boolean(payload.allowWrite),
+          mode: payload.mode || 'review'
         };
 
   if (!apiKey) {
@@ -716,7 +745,7 @@ const sendToNyx = async (payload = '') => {
         },
         {
           role: 'user',
-          content: buildPrompt({ fileContent, prompt, filePath, workspaceRoot })
+          content: buildPrompt({ fileContent, prompt, filePath, workspaceRoot, mode, allowWrite })
         }
       ],
       max_output_tokens: maxOutputTokensForTier(tier),

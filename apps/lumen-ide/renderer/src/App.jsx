@@ -144,13 +144,14 @@ export default function App() {
     };
   }, []);
 
-  const handleSendNyx = async ({ prompt, model, reasoningEffort, allowWrite }) => {
+  const handleSendNyx = async ({ prompt, model, reasoningEffort, allowWrite, mode }) => {
     setNyxStatus("thinking");
     const response = await sendToNyx(code, prompt, {
       model,
       reasoningEffort,
       filePath: activeFile,
-      allowWrite
+      allowWrite,
+      mode
     });
     const suggestions = await receiveSuggestions();
     setNyxPayload({ response, suggestions });
@@ -186,7 +187,12 @@ export default function App() {
           <MonacoEditor value={code} onChange={setCode} />
         </EditorPanel>
         <Panel style={{ gridArea: "nyx", "--panel-delay": "180ms" }}>
-          <NyxConsole status={nyxStatus} payload={nyxPayload} onSend={handleSendNyx} />
+          <NyxConsole
+            status={nyxStatus}
+            payload={nyxPayload}
+            activeFile={activeFile}
+            onSend={handleSendNyx}
+          />
         </Panel>
       </Body>
       {settingsOpen && (

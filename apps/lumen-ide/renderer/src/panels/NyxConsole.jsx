@@ -1,4 +1,4 @@
-﻿import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import styled from "styled-components";
 
 const Header = styled.div`
@@ -51,6 +51,18 @@ const SelectRow = styled.div`
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 10px;
+`;
+
+const QuickActions = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+`;
+
+const PillButton = styled.button`
+  padding: 6px 10px;
+  font-size: 11px;
+  border-radius: 999px;
 `;
 
 const ToggleRow = styled.label`
@@ -115,16 +127,57 @@ const MODEL_OPTIONS = [
   { value: "custom", label: "Custom model ID" }
 ];
 
-export default function NyxConsole({ status, payload, onSend }) {
+const MODE_OPTIONS = [
+  { value: "review", label: "Review" },
+  { value: "refactor", label: "Refactor" },
+  { value: "tests", label: "Generate tests" },
+  { value: "explain", label: "Explain" },
+  { value: "fix", label: "Bug hunt" }
+];
+
+const MODE_TEMPLATES = {
+  review: "Review the current file and suggest improvements with clear, actionable steps.",
+  refactor:
+    "Refactor the current file for clarity, maintainability, and performance. Provide a step-by-step plan and proposed edits.",
+  tests: "Generate tests for the current file. Focus on edge cases and core behavior.",
+  explain: "Explain what this file does, key flows, and how it fits the system.",
+  fix: "Identify likely bugs or risks and propose concrete fixes."
+};
+
+export default function NyxConsole({ status, payload, activeFile, onSend }) {
   const [prompt, setPrompt] = useState("");
+  const [lastTemplate, setLastTemplate] = useState("");
+  const [mode, setMode] = useState("review");
   const [modelChoice, setModelChoice] = useState("auto");
   const [customModel, setCustomModel] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState("auto");
   const [allowWrite, setAllowWrite] = useState(false);
 
+  useEffect(() => {
+    const template = MODE_TEMPLATES[mode] || "";
+    if (!prompt || prompt === lastTemplate) {
+      setPrompt(template);
+      setLastTemplate(template);
+    }
+  }, [mode]);
+
+  const handlePromptChange = (event) => {
+    setPrompt(event.target.value);
+    setLastTemplate("");
+  };
+
   const handleSend = () => {
     const model = modelChoice === "custom" ? customModel.trim() || "auto" : modelChoice;
-    onSend({ prompt: prompt.trim(), model, reasoningEffort, allowWrite });
+    onSend({ prompt: prompt.trim(), model, reasoningEffort, allowWrite, mode });
+  };
+
+  const runQuickAction = (nextMode) => {
+    const template = MODE_TEMPLATES[nextMode] || prompt;
+    const model = modelChoice === "custom" ? customModel.trim() || "auto" : modelChoice;
+    setMode(nextMode);
+    setPrompt(template);
+    setLastTemplate(template);
+    onSend({ prompt: template.trim(), model, reasoningEffort, allowWrite, mode: nextMode });
   };
 
   return (
@@ -137,11 +190,32 @@ export default function NyxConsole({ status, payload, onSend }) {
         <Status $active={status === "thinking"}>
           {status === "thinking" ? "Nyx scanning workspace..." : "Idle"}
         </Status>
+        <Field>
+          Mode
+          <Select value={mode} onChange={(event) => setMode(event.target.value)}>
+            {MODE_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </Select>
+        </Field>
         <Input
           placeholder="Describe the task for Nyx (review, refactor, tests, etc.)"
           value={prompt}
-          onChange={(event) => setPrompt(event.target.value)}
+          onChange={handlePromptChange}
         />
+        <QuickActions>
+          <PillButton type="button" onClick={() => runQuickAction("refactor")}>
+            Refactor file
+          </PillButton>
+          <PillButton type="button" onClick={() => runQuickAction("tests")}>
+            Generate tests
+          </PillButton>
+          <PillButton type="button" onClick={() => runQuickAction("explain")}>
+            Explain file
+          </PillButton>
+        </QuickActions>
         <SelectRow>
           <Field>
             Model
@@ -174,6 +248,7 @@ export default function NyxConsole({ status, payload, onSend }) {
           />
           Allow Nyx to edit files in this workspace
         </ToggleRow>
+        {activeFile && <small>Active file: {activeFile}</small>}
         {modelChoice === "custom" && (
           <Field>
             Custom model ID
