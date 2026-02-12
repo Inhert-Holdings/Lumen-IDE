@@ -1,14 +1,16 @@
 ﻿export async function sendToNyx(
   fileContent,
   prompt = '',
-  { model = 'auto', reasoningEffort = 'auto' } = {}
+  { model = 'auto', reasoningEffort = 'auto', filePath = '', allowWrite = false } = {}
 ) {
   if (window?.lumen?.nyx?.send) {
     return window.lumen.nyx.send({
       fileContent,
       prompt,
       model,
-      reasoningEffort
+      reasoningEffort,
+      filePath,
+      allowWrite
     });
   }
 

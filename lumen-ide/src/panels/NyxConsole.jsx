@@ -53,6 +53,19 @@ const SelectRow = styled.div`
   gap: 10px;
 `;
 
+const ToggleRow = styled.label`
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: rgba(200, 207, 218, 0.7);
+`;
+
+const ToggleInput = styled.input`
+  width: 16px;
+  height: 16px;
+`;
+
 const Select = styled.select`
   border-radius: 10px;
   border: 1px solid var(--border-subtle);
@@ -107,10 +120,11 @@ export default function NyxConsole({ status, payload, onSend }) {
   const [modelChoice, setModelChoice] = useState("auto");
   const [customModel, setCustomModel] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState("auto");
+  const [allowWrite, setAllowWrite] = useState(false);
 
   const handleSend = () => {
     const model = modelChoice === "custom" ? customModel.trim() || "auto" : modelChoice;
-    onSend({ prompt: prompt.trim(), model, reasoningEffort });
+    onSend({ prompt: prompt.trim(), model, reasoningEffort, allowWrite });
   };
 
   return (
@@ -152,6 +166,14 @@ export default function NyxConsole({ status, payload, onSend }) {
             </Select>
           </Field>
         </SelectRow>
+        <ToggleRow>
+          <ToggleInput
+            type="checkbox"
+            checked={allowWrite}
+            onChange={(event) => setAllowWrite(event.target.checked)}
+          />
+          Allow Nyx to edit files in this workspace
+        </ToggleRow>
         {modelChoice === "custom" && (
           <Field>
             Custom model ID

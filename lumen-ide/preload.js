@@ -11,5 +11,10 @@ contextBridge.exposeInMainWorld("lumen", {
   settings: {
     load: () => ipcRenderer.invoke("settings:load"),
     save: (settings) => ipcRenderer.invoke("settings:save", settings)
+  },
+  explorer: {
+    list: (options) => ipcRenderer.invoke("explorer:list", options),
+    selectRoot: () => ipcRenderer.invoke("explorer:selectRoot"),
+    read: (filePath) => ipcRenderer.invoke("explorer:read", { path: filePath })
   }
 });
