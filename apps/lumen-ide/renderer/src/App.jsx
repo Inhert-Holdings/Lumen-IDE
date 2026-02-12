@@ -128,6 +128,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState(null);
   const [activeFile, setActiveFile] = useState("");
+  const [workspaceRevision, setWorkspaceRevision] = useState(0);
 
   useEffect(() => {
     // Load persisted settings via the Electron main process (placeholder storage).
@@ -155,6 +156,9 @@ export default function App() {
     });
     const suggestions = await receiveSuggestions();
     setNyxPayload({ response, suggestions });
+    if (response?.actions?.length) {
+      setWorkspaceRevision((prev) => prev + 1);
+    }
     setNyxStatus("ready");
   };
 
@@ -177,7 +181,11 @@ export default function App() {
       <TopBar onOpenSettings={() => setSettingsOpen(true)} />
       <Body>
         <Panel style={{ gridArea: "explorer", "--panel-delay": "60ms" }}>
-          <ExplorerPanel activeFile={activeFile} onOpenFile={handleOpenFile} />
+          <ExplorerPanel
+            activeFile={activeFile}
+            onOpenFile={handleOpenFile}
+            refreshKey={workspaceRevision}
+          />
         </Panel>
         <EditorPanel style={{ gridArea: "editor", "--panel-delay": "120ms" }}>
           <EditorHeader>

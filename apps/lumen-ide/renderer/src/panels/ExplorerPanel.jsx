@@ -77,7 +77,7 @@ const Meta = styled.div`
   color: rgba(200, 207, 218, 0.6);
 `;
 
-export default function ExplorerPanel({ activeFile, onOpenFile }) {
+export default function ExplorerPanel({ activeFile, onOpenFile, refreshKey = 0 }) {
   const [tree, setTree] = useState(null);
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState("");
@@ -115,7 +115,7 @@ export default function ExplorerPanel({ activeFile, onOpenFile }) {
 
   useEffect(() => {
     loadWorkspace();
-  }, []);
+  }, [refreshKey]);
 
   useEffect(() => {
     if (tree?.tree?.path) {
