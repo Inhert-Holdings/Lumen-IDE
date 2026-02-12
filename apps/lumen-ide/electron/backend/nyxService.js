@@ -492,7 +492,8 @@ const MODE_INSTRUCTIONS = {
     'Refactor the current file for clarity and performance. Provide a step-by-step plan. If write access is enabled, apply changes with write_file; otherwise propose a diff and ask for approval.',
   tests: 'Generate tests for the current file with coverage for core behavior and edge cases.',
   explain: 'Explain what this file does and how its key flows work.',
-  fix: 'Identify likely bugs or risks and propose concrete fixes.'
+  fix: 'Identify likely bugs or risks and propose concrete fixes.',
+  agent: 'Operate as a full-stack coding agent. Use tools to read/search the workspace, propose a plan, and apply edits when write access is enabled. Never claim changes without using write_file or delete_file.'
 };
 
 const buildPrompt = ({ fileContent, prompt, filePath, workspaceRoot, mode, allowWrite }) => {
@@ -643,6 +644,7 @@ const executeToolCall = (call, allowWrite) => {
 const runNyxWithTools = async ({ apiKey, basePayload, allowWrite }) => {
   let input = basePayload.input || [];
   const tools = basePayload.tools || [];
+  const toolOutputs = [];
 
   let response = null;
   for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
@@ -651,21 +653,25 @@ const runNyxWithTools = async ({ apiKey, basePayload, allowWrite }) => {
     const toolCalls = outputItems.filter((item) => item.type === 'function_call');
 
     if (!toolCalls.length) {
-      return response;
+      return { response, toolOutputs };
     }
 
     input = input.concat(outputItems);
 
-    const toolOutputs = toolCalls.map((call) => ({
-      type: 'function_call_output',
-      call_id: call.call_id,
-      output: JSON.stringify(executeToolCall(call, allowWrite))
-    }));
+    const outputs = toolCalls.map((call) => {
+      const output = executeToolCall(call, allowWrite);
+      toolOutputs.push({ name: call?.name, output });
+      return {
+        type: 'function_call_output',
+        call_id: call.call_id,
+        output: JSON.stringify(output)
+      };
+    });
 
-    input = input.concat(toolOutputs);
+    input = input.concat(outputs);
   }
 
-  return response;
+  return { response, toolOutputs };
 };
 
 const sendToNyx = async (payload = '') => {
@@ -687,7 +693,7 @@ const sendToNyx = async (payload = '') => {
           reasoningEffort: 'auto',
           filePath: '',
           allowWrite: false,
-          mode: 'review'
+          mode: 'agent'
         }
       : {
           fileContent: payload.fileContent || '',
@@ -696,7 +702,7 @@ const sendToNyx = async (payload = '') => {
           reasoningEffort: payload.reasoningEffort || 'auto',
           filePath: payload.filePath || '',
           allowWrite: Boolean(payload.allowWrite),
-          mode: payload.mode || 'review'
+          mode: payload.mode || 'agent'
         };
 
   if (!apiKey) {
@@ -729,7 +735,7 @@ const sendToNyx = async (payload = '') => {
         {
           role: 'system',
           content:
-            'You are Nyx, the internal AI engine for Lumen IDE. Provide crisp, actionable guidance based on workspace data. Use tools to inspect files instead of guessing. If suggesting code, keep it concise and explain why. Avoid placeholder paths, fake citations, or line markers (no <replace_with_actual_path>, no F:, no +L1-L2). If you need to reference the file, say "the current file" instead. If write_file is unavailable, ask the user to enable file edits before proposing changes. When calling tools, you may use paths relative to the workspace root.'
+            'You are Nyx, the internal AI engine for Lumen IDE. Operate as a full coding agent: inspect the workspace with tools, outline a concise plan, then execute. If write access is enabled and a change is requested, you must use write_file or delete_file to apply it. Never claim a file was created/updated unless you called the tool. If write access is disabled, explain what would change and ask the user to enable edits. Avoid placeholder paths, fake citations, or line markers (no <replace_with_actual_path>, no F:, no +L1-L2). When referencing files, say "the current file" when possible.'
         },
         {
           role: 'user',
@@ -750,9 +756,31 @@ const sendToNyx = async (payload = '') => {
       requestPayload.temperature = 0.2;
     }
 
-    const response = await runNyxWithTools({ apiKey, basePayload: requestPayload, allowWrite });
+    const { response, toolOutputs } = await runNyxWithTools({
+      apiKey,
+      basePayload: requestPayload,
+      allowWrite
+    });
 
     const outputText = sanitizeModelOutput(extractOutputText(response));
+    const actions = (toolOutputs || [])
+      .filter((entry) => entry?.output?.status === 'ok')
+      .filter((entry) => entry.name === 'write_file' || entry.name === 'delete_file')
+      .map((entry) => ({
+        action: entry.name === 'delete_file' ? 'delete' : 'write',
+        path: entry.output.path,
+        bytes: entry.output.bytes
+      }));
+
+    const impliedWrite = /\b(create|created|write|wrote|updated|saved|deleted|removed)\b/i.test(
+      outputText || ''
+    );
+    let warning = null;
+    if (allowWrite && impliedWrite && actions.length === 0) {
+      warning =
+        'Nyx did not apply any file changes. Re-run with write access enabled and ask Nyx to use write_file.';
+    }
+
     lastResponseText = outputText;
     lastResponseMeta = {
       model: resolvedModel,
@@ -767,7 +795,9 @@ const sendToNyx = async (payload = '') => {
       model: resolvedModel,
       tier,
       reasoningEffort,
-      usage: response.usage || null
+      usage: response.usage || null,
+      actions,
+      warning
     };
   } catch (error) {
     lastResponseText = '';

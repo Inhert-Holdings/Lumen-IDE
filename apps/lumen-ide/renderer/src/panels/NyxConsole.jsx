@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import styled from "styled-components";
 
 const Header = styled.div`
@@ -53,18 +53,6 @@ const SelectRow = styled.div`
   gap: 10px;
 `;
 
-const QuickActions = styled.div`
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-`;
-
-const PillButton = styled.button`
-  padding: 6px 10px;
-  font-size: 11px;
-  border-radius: 999px;
-`;
-
 const ToggleRow = styled.label`
   display: flex;
   align-items: center;
@@ -116,6 +104,13 @@ const Status = styled.span`
   color: ${({ $active }) => ($active ? "#79f1d6" : "rgba(200, 207, 218, 0.6)")};
 `;
 
+const ActionsList = styled.div`
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+  color: rgba(200, 207, 218, 0.7);
+`;
+
 const MODEL_OPTIONS = [
   { value: "auto", label: "Auto select" },
   { value: "gpt-5.2-codex", label: "gpt-5.2-codex" },
@@ -127,58 +122,20 @@ const MODEL_OPTIONS = [
   { value: "custom", label: "Custom model ID" }
 ];
 
-const MODE_OPTIONS = [
-  { value: "review", label: "Review" },
-  { value: "refactor", label: "Refactor" },
-  { value: "tests", label: "Generate tests" },
-  { value: "explain", label: "Explain" },
-  { value: "fix", label: "Bug hunt" }
-];
-
-const MODE_TEMPLATES = {
-  review: "Review the current file and suggest improvements with clear, actionable steps.",
-  refactor:
-    "Refactor the current file for clarity, maintainability, and performance. Provide a step-by-step plan and proposed edits.",
-  tests: "Generate tests for the current file. Focus on edge cases and core behavior.",
-  explain: "Explain what this file does, key flows, and how it fits the system.",
-  fix: "Identify likely bugs or risks and propose concrete fixes."
-};
-
 export default function NyxConsole({ status, payload, activeFile, onSend }) {
   const [prompt, setPrompt] = useState("");
-  const [lastTemplate, setLastTemplate] = useState("");
-  const [mode, setMode] = useState("review");
   const [modelChoice, setModelChoice] = useState("auto");
   const [customModel, setCustomModel] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState("auto");
   const [allowWrite, setAllowWrite] = useState(false);
 
-  useEffect(() => {
-    const template = MODE_TEMPLATES[mode] || "";
-    if (!prompt || prompt === lastTemplate) {
-      setPrompt(template);
-      setLastTemplate(template);
-    }
-  }, [mode]);
-
-  const handlePromptChange = (event) => {
-    setPrompt(event.target.value);
-    setLastTemplate("");
-  };
-
   const handleSend = () => {
     const model = modelChoice === "custom" ? customModel.trim() || "auto" : modelChoice;
-    onSend({ prompt: prompt.trim(), model, reasoningEffort, allowWrite, mode });
+    onSend({ prompt: prompt.trim(), model, reasoningEffort, allowWrite, mode: "agent" });
   };
 
-  const runQuickAction = (nextMode) => {
-    const template = MODE_TEMPLATES[nextMode] || prompt;
-    const model = modelChoice === "custom" ? customModel.trim() || "auto" : modelChoice;
-    setMode(nextMode);
-    setPrompt(template);
-    setLastTemplate(template);
-    onSend({ prompt: template.trim(), model, reasoningEffort, allowWrite, mode: nextMode });
-  };
+  const actions = payload?.response?.actions || [];
+  const warning = payload?.response?.warning;
 
   return (
     <>
@@ -190,32 +147,11 @@ export default function NyxConsole({ status, payload, activeFile, onSend }) {
         <Status $active={status === "thinking"}>
           {status === "thinking" ? "Nyx scanning workspace..." : "Idle"}
         </Status>
-        <Field>
-          Mode
-          <Select value={mode} onChange={(event) => setMode(event.target.value)}>
-            {MODE_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </Select>
-        </Field>
         <Input
-          placeholder="Describe the task for Nyx (review, refactor, tests, etc.)"
+          placeholder="Ask Nyx to build, refactor, generate tests, or explain anything in the workspace"
           value={prompt}
-          onChange={handlePromptChange}
+          onChange={(event) => setPrompt(event.target.value)}
         />
-        <QuickActions>
-          <PillButton type="button" onClick={() => runQuickAction("refactor")}>
-            Refactor file
-          </PillButton>
-          <PillButton type="button" onClick={() => runQuickAction("tests")}>
-            Generate tests
-          </PillButton>
-          <PillButton type="button" onClick={() => runQuickAction("explain")}>
-            Explain file
-          </PillButton>
-        </QuickActions>
         <SelectRow>
           <Field>
             Model
@@ -260,11 +196,24 @@ export default function NyxConsole({ status, payload, activeFile, onSend }) {
           </Field>
         )}
         {!payload && (
-          <p>Nyx is warming up. Send your current file to receive AI suggestions.</p>
+          <p>Nyx is ready. Ask for a task and it will inspect the workspace as needed.</p>
         )}
         {payload && (
           <>
             <ResponseBox>{payload.response?.message}</ResponseBox>
+            {warning && <small>{warning}</small>}
+            {actions.length > 0 && (
+              <div>
+                <strong>Applied changes</strong>
+                <ActionsList>
+                  {actions.map((action) => (
+                    <div key={`${action.action}-${action.path}`}>
+                      {action.action.toUpperCase()}: {action.path}
+                    </div>
+                  ))}
+                </ActionsList>
+              </div>
+            )}
             <div>
               <strong>Suggestions</strong>
               <div style={{ display: "grid", gap: "8px", marginTop: "8px" }}>

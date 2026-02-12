@@ -84,8 +84,6 @@ apps/lumen-ide/
 - `electron/backend/openaiClient.js` wraps `/v1/models` and `/v1/responses`.
 - `electron/main.js` exposes IPC handlers (`nyx:send`, `nyx:suggestions`, `settings:*`).
 
-Nyx console modes include Review, Refactor, Tests, Explain, and Bug Hunt. Toggle "Allow Nyx to edit files" to enable write tools for refactor workflows.
-
 Replace the placeholder logic with real AI runtime, vector memory, and server connectors.
 
 ## Notes
