@@ -9,6 +9,7 @@ This repo is a monorepo with multiple deliverables. Use this map to find entry p
 - `apps/` - End-user apps and services.
 - `apps/codex-cli/` - CLI packaging and distribution.
 - `apps/shell-tool-mcp/` - MCP server for the shell tool.
+- `apps/lumen-ide/` - Electron desktop IDE (Nyx-powered).
 - `codex-rs/` - Rust workspace (core engine, TUI, app-server).
 - `docs/` - Documentation.
 - `patches/` - Patch files used by build or release workflows.
@@ -22,6 +23,7 @@ This repo is a monorepo with multiple deliverables. Use this map to find entry p
 - `docs/install.md` - Build and install steps.
 - `docs/contributing.md` - Contribution workflow.
 - `apps/codex-cli/README.md` - CLI packaging and usage details.
+- `apps/lumen-ide/README.md` - Lumen IDE setup and usage.
 - `codex-rs/README.md` - Rust workspace overview.
 - `apps/shell-tool-mcp/README.md` - MCP server overview.
 

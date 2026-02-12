@@ -53,6 +53,10 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 
 This repo is a monorepo. See [Repository layout](./docs/repo-layout.md) for a map of top-level folders and key entry points.
 
+## Lumen IDE
+
+The Electron desktop IDE lives in `apps/lumen-ide`. See `apps/lumen-ide/README.md` for setup and local run instructions.
+
 ## Docs
 
 - [**Codex Documentation**](https://developers.openai.com/codex)
