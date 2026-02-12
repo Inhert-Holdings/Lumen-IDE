@@ -66,22 +66,23 @@ Artifacts land in `apps/lumen-ide/release/`.
 
 ```
 apps/lumen-ide/
-  backend/          # Nyx engine + OpenAI client
-  src/
-    components/     # Top bar, settings panel
-    editor/         # Monaco editor integration
-    panels/         # Explorer + Nyx console
-    services/       # Renderer-side Nyx bridge
-  main.js           # Electron main process
-  preload.js        # IPC bridge (future secure API)
+  electron/         # Electron main + Nyx backend
+    backend/         # OpenAI client + Nyx engine
+  renderer/         # React + Monaco UI
+    src/
+      components/   # Top bar, settings panel
+      editor/       # Monaco editor integration
+      panels/       # Explorer + Nyx console
+      services/     # Renderer-side Nyx bridge
+  scripts/          # Local dev helpers
 ```
 
 ## Nyx Integration
 
-- `src/services/nyxService.js` is the renderer-side API.
-- `backend/nyxService.js` handles model selection + live inference.
-- `backend/openaiClient.js` wraps `/v1/models` and `/v1/responses`.
-- `main.js` exposes IPC handlers (`nyx:send`, `nyx:suggestions`, `settings:*`).
+- `renderer/src/services/nyxService.js` is the renderer-side API.
+- `electron/backend/nyxService.js` handles model selection + live inference.
+- `electron/backend/openaiClient.js` wraps `/v1/models` and `/v1/responses`.
+- `electron/main.js` exposes IPC handlers (`nyx:send`, `nyx:suggestions`, `settings:*`).
 
 Replace the placeholder logic with real AI runtime, vector memory, and server connectors.
 

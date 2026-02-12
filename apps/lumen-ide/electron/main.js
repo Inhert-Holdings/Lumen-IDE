@@ -1,15 +1,17 @@
 ﻿const path = require("path");
 const fs = require("fs");
 
-require("dotenv").config({ path: path.join(__dirname, ".env") });
+const APP_ROOT = path.resolve(__dirname, "..");
+
+require("dotenv").config({ path: path.join(APP_ROOT, ".env") });
 
 const { app, BrowserWindow, ipcMain, dialog } = require("electron");
 const { sendToNyx, receiveSuggestions } = require("./backend/nyxService");
 
 const SETTINGS_FILE = "lumen-settings.enc.json";
 const WORKSPACE_STATE_FILE = "lumen-workspace.json";
-const USER_DATA_DIR = path.join(__dirname, ".lumen-user");
-const DEFAULT_WORKSPACE_ROOT = path.resolve(__dirname);
+const USER_DATA_DIR = path.join(APP_ROOT, ".lumen-user");
+const DEFAULT_WORKSPACE_ROOT = APP_ROOT;
 let workspaceRoot = DEFAULT_WORKSPACE_ROOT;
 const MAX_FILE_BYTES = 512 * 1024;
 const MAX_TREE_DEPTH = 4;
@@ -204,7 +206,7 @@ async function createWindow() {
   if (devUrl) {
     await win.loadURL(devUrl);
   } else {
-    await win.loadFile(path.join(__dirname, "dist", "index.html"));
+    await win.loadFile(path.join(APP_ROOT, "dist", "index.html"));
   }
 }
 

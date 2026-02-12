@@ -11,7 +11,8 @@ let lastResponseMeta = null;
 const MODEL_CACHE_TTL_MS = 10 * 60 * 1000;
 
 const WORKSPACE_STATE_FILE = 'lumen-workspace.json';
-const DEFAULT_WORKSPACE_ROOT = path.resolve(__dirname, '..');
+const APP_ROOT = path.resolve(__dirname, '..', '..');
+const DEFAULT_WORKSPACE_ROOT = APP_ROOT;
 const MAX_TOOL_FILE_BYTES = 512 * 1024;
 const MAX_TREE_ENTRIES = 1200;
 const EXCLUDED_DIRS = new Set(['.git', 'node_modules', 'dist', 'out', 'build', '.lumen-user']);
@@ -29,9 +30,9 @@ const MAX_SEARCH_FILE_BYTES = 300 * 1024;
 
 const getUserDataDir = () => {
   try {
-    return app?.getPath?.('userData') || path.join(DEFAULT_WORKSPACE_ROOT, '.lumen-user');
+    return app?.getPath?.('userData') || path.join(APP_ROOT, '.lumen-user');
   } catch {
-    return path.join(DEFAULT_WORKSPACE_ROOT, '.lumen-user');
+    return path.join(APP_ROOT, '.lumen-user');
   }
 };
 

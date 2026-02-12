@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Lumen IDE - AI-first desktop IDE powered by Nyx.",
-  "main": "main.js",
+  "main": "electron/main.js",
   "author": "Inhert Holdings",
   "license": "Apache-2.0",
   "scripts": {
@@ -36,8 +36,7 @@
     "productName": "Lumen IDE",
     "files": [
       "dist/**/*",
-      "main.js",
-      "preload.js",
+      "electron/**/*",
       "package.json"
     ],
     "directories": {
