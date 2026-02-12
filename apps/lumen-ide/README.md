@@ -5,7 +5,7 @@ Lumen IDE is a premium AI-first desktop IDE built on top of the OpenAI Codex rep
 ## Setup
 
 ```bash
-cd lumen-ide
+cd apps/lumen-ide
 npm install
 ```
 
@@ -60,12 +60,12 @@ Nyx uses `OPENAI_API_KEY` and an optional `OPENAI_BASE_URL` for enterprise routi
 npm run build
 ```
 
-Artifacts land in `lumen-ide/release/`.
+Artifacts land in `apps/lumen-ide/release/`.
 
 ## Folder Structure
 
 ```
-lumen-ide/
+apps/lumen-ide/
   backend/          # Nyx engine + OpenAI client
   src/
     components/     # Top bar, settings panel
@@ -88,5 +88,5 @@ Replace the placeholder logic with real AI runtime, vector memory, and server co
 ## Notes
 
 - Codex CLI remains intact at the repo root.
-- Lumen IDE is additive and isolated under `/lumen-ide`.
-- Local settings are stored in `lumen-ide/.lumen-user/` for this build.
+- Lumen IDE is additive and isolated under `/apps/lumen-ide`.
+- Local settings are stored in `apps/lumen-ide/.lumen-user/` for this build.
