@@ -55,7 +55,9 @@ This repo is a monorepo. See [Repository layout](./docs/repo-layout.md) for a ma
 
 ## Lumen IDE
 
-The Electron desktop IDE lives in `apps/lumen-ide`. See `apps/lumen-ide/README.md` for setup and local run instructions.
+The current Electron desktop IDE lives in `apps/desktop`. See `apps/desktop/README.md` for setup, local run, and packaging instructions.
+
+Legacy prototype files remain in `apps/lumen-ide`.
 
 ## Docs
 

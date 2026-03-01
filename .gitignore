@@ -91,3 +91,9 @@ CHANGELOG.ignore.md
 __pycache__/
 *.pyc
 
+# Lumen local build/runtime artifacts
+/Lumen IDE All-in-One Rebrand*/
+/Lumen IDE Setup *.exe
+/Logo/
+/apps/desktop/electron/runtime/ollama-models/
+

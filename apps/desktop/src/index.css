@@ -1,0 +1,60 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.app-shell {
+  width: 100%;
+  height: 100%;
+  background: radial-gradient(circle at 15% -10%, #13243f 0%, #0c1017 32%, #090d14 100%);
+}
+
+.compact {
+  --lumen-gap: 4px;
+  --lumen-font: 11px;
+}
+
+.normal {
+  --lumen-gap: 8px;
+  --lumen-font: 12px;
+}
+
+.lumen-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #304057 #0b111c;
+}
+
+.lumen-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.lumen-scroll::-webkit-scrollbar-thumb {
+  background: #2f3e53;
+}
+
+.lumen-scroll::-webkit-scrollbar-track {
+  background: #0a0f18;
+}
+
+.monaco-editor,
+.xterm {
+  font-family: "JetBrains Mono", Consolas, monospace !important;
+}

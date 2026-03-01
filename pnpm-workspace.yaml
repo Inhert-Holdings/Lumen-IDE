@@ -1,12 +1,20 @@
 packages:
+  - apps/desktop
   - apps/codex-cli
   - apps/lumen-ide
+  - packages/core-agent
+  - packages/llm-client
   - codex-rs/responses-api-proxy/npm
   - packages/sdk/typescript
   - apps/shell-tool-mcp
 
 ignoredBuiltDependencies:
   - esbuild
+
+onlyBuiltDependencies:
+  - electron
+  - electron-winstaller
+  - node-pty
 
 minimumReleaseAge: 10080
 

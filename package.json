@@ -3,6 +3,8 @@
   "private": true,
   "description": "Tools for repo-wide maintenance.",
   "scripts": {
+    "dev": "pnpm --filter @lumen/desktop dev",
+    "build": "pnpm --filter @lumen/desktop build",
     "format": "prettier --check *.json *.md docs/*.md .github/workflows/*.yml **/*.js",
     "format:fix": "prettier --write *.json *.md docs/*.md .github/workflows/*.yml **/*.js"
   },
