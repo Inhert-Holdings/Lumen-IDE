@@ -37,6 +37,7 @@ export default function App() {
   const addTerminalTab = useAppStore((state) => state.addTerminalTab);
 
   const activeTab = tabs.find((tab) => tab.id === activeTabId) || null;
+  const workspaceName = workspaceRoot ? basename(workspaceRoot) : "No Workspace";
 
   const refreshTree = useCallback(async () => {
     const [rootResult, treeResult] = await Promise.all([window.lumen.workspace.getRoot(), window.lumen.workspace.list()]);
@@ -147,25 +148,33 @@ export default function App() {
 
   return (
     <div className={`app-shell ${settings.compactMode ? "compact" : "normal"}`}>
-      <div className="flex h-9 items-center justify-between border-b border-border bg-[#0f1623]/90 px-2 text-xs">
-        <div className="flex items-center gap-2">
-          <img src={logo} alt="Lumen IDE logo" className="h-5 w-5 object-contain" />
-          <span className="font-semibold text-accent">Lumen IDE</span>
-          <Button onClick={() => void openFolder()}>Open Folder</Button>
-          <Button onClick={() => void saveActiveTab()} disabled={!activeTab || !activeTab.dirty}>
-            Save
-          </Button>
+      <div className="flex h-12 items-center justify-between border-b border-white/5 bg-black/20 px-3">
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-white/10 bg-white/5 shadow-[0_0_0_1px_rgba(255,255,255,0.02)]">
+            <img src={logo} alt="Lumen IDE logo" className="h-5 w-5 object-contain" />
+          </div>
+          <div className="min-w-0">
+            <div className="text-[12px] font-semibold tracking-[0.18em] text-accent">LUMEN IDE</div>
+            <div className="truncate text-[11px] text-muted">{workspaceName}</div>
+          </div>
+          <div className="hidden items-center gap-2 md:flex">
+            <Button onClick={() => void openFolder()}>Open Folder</Button>
+            <Button onClick={() => void saveActiveTab()} disabled={!activeTab || !activeTab.dirty}>
+              Save
+            </Button>
+          </div>
         </div>
-        <div className="flex items-center gap-2 text-[11px] text-muted">
-          <span>{workspaceRoot || "No workspace"}</span>
-          <span className={settings.onlineMode ? "text-warn" : "text-good"}>
-            Online: {settings.onlineMode ? "ON" : "OFF"}
+        <div className="flex items-center gap-2 text-[11px]">
+          <span className="shell-pill hidden max-w-[260px] truncate lg:inline-flex">{workspaceRoot || "No workspace selected"}</span>
+          <span className={`shell-pill ${settings.onlineMode ? "text-warn" : "text-good"}`}>
+            {settings.onlineMode ? "Online On" : "Offline First"}
           </span>
-          <span>{settings.model}</span>
+          <span className="shell-pill hidden sm:inline-flex">{settings.provider}</span>
+          <span className="shell-pill hidden xl:inline-flex">{settings.model}</span>
         </div>
       </div>
 
-      <div className="h-[calc(100%-36px)]">
+      <div className="h-[calc(100%-76px)] px-2 py-2">
         <PanelGroup direction="vertical">
           <Panel defaultSize={terminalVisible ? 72 : 100} minSize={45}>
             <PanelGroup direction="horizontal">
@@ -174,7 +183,7 @@ export default function App() {
                   <Panel defaultSize={18} minSize={12}>
                     <ExplorerPanel refreshTree={refreshTree} openFile={openFile} />
                   </Panel>
-                  <PanelResizeHandle className="w-1 bg-border/70 hover:bg-accent/40" />
+                  <PanelResizeHandle className="mx-1 w-1 rounded-full bg-white/8 transition hover:bg-accent/40" />
                 </>
               )}
 
@@ -182,7 +191,7 @@ export default function App() {
                 <EditorPanel saveActiveTab={saveActiveTab} />
               </Panel>
 
-              <PanelResizeHandle className="w-1 bg-border/70 hover:bg-accent/40" />
+              <PanelResizeHandle className="mx-1 w-1 rounded-full bg-white/8 transition hover:bg-accent/40" />
 
               <Panel defaultSize={25} minSize={20}>
                 <RightPanel refreshTree={refreshTree} openFile={openFile} />
@@ -192,13 +201,25 @@ export default function App() {
 
           {terminalVisible && (
             <>
-              <PanelResizeHandle className="h-1 bg-border/70 hover:bg-accent/40" />
+              <PanelResizeHandle className="my-1 h-1 rounded-full bg-white/8 transition hover:bg-accent/40" />
               <Panel defaultSize={28} minSize={12}>
                 <TerminalPanel />
               </Panel>
             </>
           )}
         </PanelGroup>
+      </div>
+
+      <div className="flex h-7 items-center justify-between border-t border-white/5 bg-black/25 px-3 text-[11px] text-muted">
+        <div className="flex min-w-0 items-center gap-3">
+          <span className="truncate">{activeTab ? activeTab.path : "No file open"}</span>
+          <span>{tabs.length} tab{tabs.length === 1 ? "" : "s"}</span>
+        </div>
+        <div className="flex items-center gap-3">
+          <span>Explorer {explorerVisible ? "visible" : "hidden"}</span>
+          <span>Terminal {terminalVisible ? "visible" : "hidden"}</span>
+          <span>{settings.compactMode ? "Compact" : "Comfort"}</span>
+        </div>
       </div>
 
       <CommandPalette open={commandPaletteOpen} commands={commands} onClose={() => toggleCommandPalette(false)} />

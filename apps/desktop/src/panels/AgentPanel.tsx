@@ -37,8 +37,30 @@ type ApprovalRequest = {
 
 type ReasoningLevel = "low" | "medium" | "high" | "extra_high";
 
+type RelatedFileContext = {
+  path: string;
+  content: string;
+};
+
+type DirectEditResult = {
+  pendingChange: {
+    id: string;
+    type: "write";
+    path: string;
+    previousContent: string;
+    nextContent: string;
+    diff: string;
+  };
+  summary: string;
+  relatedPaths: string[];
+};
+
 function makeId() {
   return `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+}
+
+function fileLabel(inputPath: string) {
+  return inputPath.split(/[\\/]/).filter(Boolean).at(-1) || inputPath;
 }
 
 function normalizePath(root: string, inputPath?: string) {
@@ -56,7 +78,7 @@ function extractPathFromPrompt(goal: string) {
 }
 
 function isEditIntent(goal: string) {
-  return /\b(edit|change|modify|update|fix|rewrite|refactor|improve|patch)\b/i.test(goal);
+  return /\b(edit|change|modify|update|fix|rewrite|refactor|improve|patch|add|remove|replace|rename|implement|convert|optimize|clean up)\b/i.test(goal);
 }
 
 function isReadIntent(goal: string) {
@@ -228,10 +250,12 @@ function maxPlannerActions(level: ReasoningLevel) {
 }
 
 function shouldRunVerify(level: ReasoningLevel, goal: string, pendingChanges: number) {
+  const explicitVerify = /\b(test|lint|verify|check|build|compile)\b/i.test(goal);
+  const heavierEdit = /\b(refactor|rewrite|migrate|convert)\b/i.test(goal);
   if (level === "low") return false;
-  if (level === "medium") return pendingChanges > 0;
-  if (level === "high") return pendingChanges > 0 || /\b(test|lint|verify|check)\b/i.test(goal);
-  return pendingChanges > 0 || /\b(test|lint|verify|check)\b/i.test(goal);
+  if (level === "medium") return explicitVerify;
+  if (level === "high") return explicitVerify || (pendingChanges > 0 && heavierEdit);
+  return pendingChanges > 0 || explicitVerify;
 }
 
 function stringifyOutput(value: unknown) {
@@ -241,6 +265,56 @@ function stringifyOutput(value: unknown) {
   } catch {
     return String(value);
   }
+}
+
+function parseRelativeSpecifiers(source: string) {
+  const specifiers = new Set<string>();
+  const patterns = [
+    /(?:import|export)\s+[^"'`]*?\sfrom\s+["']([^"']+)["']/g,
+    /import\s*\(\s*["']([^"']+)["']\s*\)/g,
+    /require\(\s*["']([^"']+)["']\s*\)/g
+  ];
+
+  for (const pattern of patterns) {
+    let match = pattern.exec(source);
+    while (match) {
+      const specifier = match[1]?.trim();
+      if (specifier?.startsWith(".")) {
+        specifiers.add(specifier);
+      }
+      match = pattern.exec(source);
+    }
+  }
+
+  return Array.from(specifiers);
+}
+
+function resolveLocalCandidatePaths(targetPath: string, specifier: string) {
+  const normalizedBase = normalizePath(targetPath.replace(/[\\/][^\\/]+$/, ""), specifier).replace(/\//g, "\\");
+  const candidates = new Set<string>();
+  const extensions = ["", ".ts", ".tsx", ".js", ".jsx", ".css", ".json", ".md", "\\index.ts", "\\index.tsx", "\\index.js"];
+
+  for (const extension of extensions) {
+    candidates.add(`${normalizedBase}${extension}`);
+  }
+
+  return Array.from(candidates);
+}
+
+function buildFastSummary(
+  goal: string,
+  actions: AgentAction[],
+  actionResults: Array<{ action: AgentAction; result: { ok: boolean; output?: unknown; error?: string }; skipped?: boolean }>,
+  pendingCount: number,
+  verifyResult: { ok: boolean; output?: unknown; error?: string } | null,
+  extra?: string
+) {
+  const completed = actionResults.filter((item) => item.result.ok && !item.skipped).length;
+  const firstChange = actionResults.find((item) => item.action.path)?.action.path;
+  const targetText = firstChange ? ` Target: ${fileLabel(firstChange)}.` : "";
+  const verifyText = verifyResult ? ` Verify: ${verifyResult.ok ? "pass" : "fail"}.` : "";
+  const extraText = extra ? ` ${extra}` : "";
+  return `Ran ${completed}/${actions.length} actions for "${goal}". Pending changes: ${pendingCount}.${targetText}${verifyText}${extraText}`.trim();
 }
 
 export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
@@ -288,7 +362,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
 
   const streamToText = async (
     modelMessages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
-    options?: { includeReasoning?: boolean }
+    options?: { includeReasoning?: boolean; statusLabel?: string }
   ) => {
     const requestId = makeId();
     const chosenModel = chatModel.trim() || settings.model;
@@ -299,7 +373,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
 
     return await new Promise<string>((resolve, reject) => {
       let full = "";
-      setStreamStatus(`Contacting model: ${chosenModel}`);
+      setStreamStatus(options?.statusLabel || `Contacting model: ${chosenModel}`);
 
       const offChunk = window.lumen.llm.onChunk(({ requestId: chunkId, delta }) => {
         if (chunkId !== requestId) return;
@@ -350,52 +424,45 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
     });
   };
 
-  const summarizeRun = async (
-    goal: string,
-    actions: AgentAction[],
-    actionResults: Array<{ action: AgentAction; result: { ok: boolean; output?: unknown; error?: string }; skipped?: boolean }>,
-    pendingCount: number,
-    verifyResult: { ok: boolean; output?: unknown; error?: string } | null
-  ) => {
-    const outputPreview = actionResults
-      .slice(0, 8)
-      .map(({ action, result, skipped }) => {
-        const outputText = stringifyOutput(result.output ?? result.error ?? "").slice(0, 500);
-        return {
-          type: action.type,
-          ok: result.ok,
-          skipped: Boolean(skipped),
-          output: outputText
-        };
-      });
-
-    const summaryInput = {
-      goal,
-      actions: actions.map((action) => action.type),
-      results: outputPreview,
-      pendingChanges: pendingCount,
-      verify: verifyResult ? { ok: verifyResult.ok, output: stringifyOutput(verifyResult.output ?? verifyResult.error ?? "").slice(0, 300) } : null
-    };
-
-    const systemPrompt =
-      "You are Lumen IDE assistant. Reply with practical results for the user request. Do not output generic planning text. Mention what was actually found/done and what the user can do next in one short paragraph.";
-
-    const text = await streamToText(
-      [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: JSON.stringify(summaryInput) }
-      ],
-      { includeReasoning: true }
-    );
-
-    return text.trim();
-  };
-
   const resolveTargetPath = (goal: string) => {
     const fromPrompt = extractPathFromPrompt(goal);
     if (fromPrompt) return normalizePath(workspaceRoot, fromPrompt);
     if (activeTabPath) return activeTabPath;
     return "";
+  };
+
+  const gatherRelatedContext = async (targetPath: string, source: string) => {
+    const candidatePaths = new Set<string>();
+    for (const specifier of parseRelativeSpecifiers(source)) {
+      for (const candidate of resolveLocalCandidatePaths(targetPath, specifier)) {
+        candidatePaths.add(candidate);
+      }
+    }
+
+    const siblingBase = targetPath.replace(/\.[^.]+$/, "");
+    [`${siblingBase}.css`, `${siblingBase}.module.css`, `${siblingBase}.json`].forEach((candidate) => candidatePaths.add(candidate));
+
+    const related: RelatedFileContext[] = [];
+    for (const candidate of Array.from(candidatePaths)) {
+      if (candidate === targetPath || related.length >= 3) continue;
+      try {
+        const file = await window.lumen.workspace.read({ path: candidate });
+        if (!file.content.trim()) continue;
+        related.push({
+          path: file.path,
+          content: file.content.slice(0, 12000)
+        });
+      } catch {
+        // Ignore missing or unreadable neighbor files.
+      }
+    }
+
+    return related;
+  };
+
+  const shouldUseDirectEditPath = (goal: string) => {
+    if (isBuildIntent(goal) || !isEditIntent(goal)) return false;
+    return Boolean(resolveTargetPath(goal));
   };
 
   const heuristicActions = (goal: string): AgentAction[] => {
@@ -459,47 +526,77 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
     }
   };
 
-  const proposeDirectEdit = async (goal: string) => {
+  const proposeDirectEdit = async (goal: string): Promise<DirectEditResult | null> => {
     const targetPath = resolveTargetPath(goal);
     if (!targetPath || !isEditIntent(goal)) return null;
 
-    const read = await window.lumen.workspace.read({ path: targetPath });
-    const before = read.content;
-    if (!before.trim()) return null;
+    let before = "";
+    try {
+      before = (await window.lumen.workspace.read({ path: targetPath })).content;
+    } catch {
+      before = "";
+    }
+
     if (before.length > 180000) {
       throw new Error("Active file is too large for direct edit fallback. Open a smaller file or specify targeted edits.");
     }
 
+    const relatedContext = before ? await gatherRelatedContext(targetPath, before) : [];
+
     const systemPrompt = [
-      "You are an expert code editor.",
+      "You are Lumen IDE fast edit mode.",
       reasoningInstruction(reasoningLevel),
-      "Return only the FULL updated file content.",
-      "Do not include markdown fences.",
-      "Preserve unrelated code."
+      "Return only JSON with keys summary and content.",
+      'Schema: {"summary":"short user-facing summary","content":"full updated file content"}',
+      "Make the smallest correct edit that satisfies the request.",
+      "Preserve unrelated code, imports, formatting style, and working behavior.",
+      "Do not include markdown fences or extra prose."
     ].join("\n");
 
     const text = await streamToText([
       { role: "system", content: systemPrompt },
       {
         role: "user",
-        content: `User request:\n${goal}\n\nFile path:\n${targetPath}\n\nCurrent file content:\n${before}`
+        content: [
+          `User request:\n${goal}`,
+          `Target file:\n${targetPath}`,
+          before ? `Current file content:\n${before}` : "Current file content:\n<file does not exist yet>",
+          relatedContext.length
+            ? `Related workspace context:\n${relatedContext
+                .map((item) => `FILE: ${item.path}\n${item.content}`)
+                .join("\n\n")}`
+            : ""
+        ]
+          .filter(Boolean)
+          .join("\n\n")
       }
-    ]);
+    ], { statusLabel: `Editing ${fileLabel(targetPath)}...` });
 
-    const cleaned = text
-      .replace(/^```[a-zA-Z0-9_-]*\n?/, "")
-      .replace(/\n?```$/, "")
-      .trimEnd();
+    const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+    let nextContent = "";
+    let summary = "";
 
-    if (!cleaned || cleaned === before) return null;
+    try {
+      const parsed = JSON.parse(cleaned) as { summary?: string; content?: string };
+      nextContent = String(parsed.content || "").trimEnd();
+      summary = String(parsed.summary || "").trim();
+    } catch {
+      nextContent = cleaned.trimEnd();
+    }
+
+    if (!nextContent || nextContent === before) return null;
 
     return {
-      id: makeId(),
-      type: "write" as const,
-      path: targetPath,
-      previousContent: before,
-      nextContent: cleaned,
-      diff: buildDiff(targetPath, before, cleaned)
+      pendingChange: {
+        id: makeId(),
+        type: "write" as const,
+        path: targetPath,
+        previousContent: before,
+        nextContent,
+        diff: buildDiff(targetPath, before, nextContent)
+      },
+      summary: summary || `Prepared edits for ${fileLabel(targetPath)}.`,
+      relatedPaths: relatedContext.map((item) => item.path)
     };
   };
 
@@ -520,7 +617,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
       const text = await streamToText([
         { role: "system", content: systemPrompt },
         { role: "user", content: goal }
-      ]);
+      ], { statusLabel: "Planning actions..." });
       const actions = extractActionsFromText(text).slice(0, maxPlannerActions(reasoningLevel));
       if (actions.length === 0) {
         return heuristicActions(goal);
@@ -632,11 +729,83 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
 
     setBusy(true);
     setError("");
-    setStreamStatus("Planning actions...");
     pushMessage("user", goal);
     setPrompt("");
 
     try {
+      if (shouldUseDirectEditPath(goal)) {
+        const fastEdit = await proposeDirectEdit(goal);
+        if (fastEdit) {
+          const pendingList = [
+            {
+              id: fastEdit.pendingChange.id,
+              path: fastEdit.pendingChange.path,
+              type: fastEdit.pendingChange.type,
+              diff: fastEdit.pendingChange.diff,
+              nextContent: fastEdit.pendingChange.nextContent
+            }
+          ];
+          const directAction: AgentAction = {
+            type: "write_file",
+            path: fastEdit.pendingChange.path,
+            reason: "Fast direct edit path"
+          };
+
+          setPlanLines([
+            `FAST EDIT: ${fileLabel(fastEdit.pendingChange.path)}`,
+            "CONTEXT: use active file and nearby imports",
+            "PROPOSE: generate one pending diff immediately",
+            "APPLY: only after explicit approval"
+          ]);
+          setPendingChanges(pendingList);
+          appendAudit({
+            id: makeId(),
+            timestamp: new Date().toISOString(),
+            action: "agent.fast_edit",
+            detail: {
+              path: fastEdit.pendingChange.path,
+              relatedFiles: fastEdit.relatedPaths
+            }
+          });
+
+          let verifyResult: { ok: boolean; output?: unknown; error?: string } | null = null;
+          const shouldVerify = shouldRunVerify(reasoningLevel, goal, pendingList.length);
+          if (shouldVerify) {
+            const verifyAction: AgentAction = {
+              type: "run_cmd",
+              command: "pnpm test --if-present",
+              reason: "VERIFY step after fast edit"
+            };
+            const verifyRequirement = permissionForAction(verifyAction);
+            let verifyApproved = true;
+            if (verifyRequirement.approvalRequired) {
+              verifyApproved = await requestApproval(verifyAction, verifyRequirement);
+            }
+            if (verifyApproved) {
+              verifyResult = await executeAction(verifyAction);
+              appendAudit({
+                id: makeId(),
+                timestamp: new Date().toISOString(),
+                action: "agent.verify",
+                detail: { ok: verifyResult.ok, path: fastEdit.pendingChange.path }
+              });
+            }
+          }
+
+          pushMessage(
+            "assistant",
+            `${fastEdit.summary}${fastEdit.relatedPaths.length ? ` Context: ${fastEdit.relatedPaths.map(fileLabel).join(", ")}.` : ""}${
+              verifyResult ? ` Verify: ${verifyResult.ok ? "pass" : "fail"}.` : ""
+            }`,
+            {
+              reasoning: reasoningLevel,
+              model: chatModel.trim() || settings.model
+            }
+          );
+          return;
+        }
+      }
+
       let actions = await planActions(goal);
 
       let loopResult = await runAutonomousLoop({
@@ -706,7 +875,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
         return null;
       });
       const allPendingChanges = fallbackEdit
-        ? [...loopResult.pendingChanges, fallbackEdit]
+        ? [...loopResult.pendingChanges, fallbackEdit.pendingChange]
         : loopResult.pendingChanges;
 
       setPlanLines(loopResult.plan);
@@ -720,22 +889,13 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
         }))
       );
 
-      let assistantReply = "";
-      try {
-        assistantReply = await summarizeRun(
-          goal,
-          actions,
-          loopResult.actionResults,
-          allPendingChanges.length,
-          verifyResult
-        );
-      } catch {
-        assistantReply = [
-          `Completed ${loopResult.actionResults.length} action(s).`,
-          `Pending changes: ${allPendingChanges.length}.`,
-          verifyResult ? `Verify: ${verifyResult.ok ? "pass" : "fail"}.` : "Verify: skipped."
-        ].join(" ");
-      }
+      const assistantReply = buildFastSummary(
+        goal,
+        actions,
+        loopResult.actionResults,
+        allPendingChanges.length,
+        verifyResult
+      );
 
       pushMessage("assistant", assistantReply, {
         reasoning: reasoningLevel,

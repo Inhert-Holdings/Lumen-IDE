@@ -30,14 +30,32 @@ export function EditorPanel({ saveActiveTab }: EditorPanelProps) {
   const activeTab = tabs.find((tab) => tab.id === activeTabId) || null;
 
   return (
-    <div className="flex h-full flex-col bg-[#0f1520]/70">
-      <div className="flex h-8 items-center border-b border-border bg-black/20 px-1">
-        <div className="lumen-scroll flex min-w-0 flex-1 gap-1 overflow-x-auto">
+    <div className="flex h-full flex-col overflow-hidden rounded-2xl border border-white/8 bg-[linear-gradient(180deg,rgba(16,22,32,0.94),rgba(9,13,20,0.98))] shadow-[0_14px_40px_rgba(0,0,0,0.24)]">
+      <div className="border-b border-white/8 px-2 py-2">
+        <div className="mb-2 flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-[11px] uppercase tracking-[0.18em] text-muted">Editor</div>
+            <div className="truncate text-[12px] text-text">{activeTab?.path || "Open a file from Explorer"}</div>
+          </div>
+          <div className="flex items-center gap-2">
+            {activeTab && (
+              <span className={`shell-pill ${activeTab.dirty ? "text-warn" : "text-muted"}`}>
+                {activeTab.dirty ? "Unsaved" : "Saved"}
+              </span>
+            )}
+            <Button className="ml-0" onClick={() => void saveActiveTab()}>
+              Save
+            </Button>
+          </div>
+        </div>
+        <div className="lumen-scroll flex min-w-0 gap-1 overflow-x-auto">
           {tabs.map((tab) => (
             <button
               key={tab.id}
-              className={`group flex h-6 items-center gap-2 rounded px-2 text-[11px] ${
-                tab.id === activeTabId ? "bg-accent/20 text-accent" : "text-muted hover:text-text"
+              className={`group flex h-7 items-center gap-2 rounded-lg border px-2 text-[11px] transition ${
+                tab.id === activeTabId
+                  ? "border-accent/40 bg-accent/10 text-accent"
+                  : "border-white/8 bg-white/5 text-muted hover:text-text"
               }`}
               onClick={() => setActiveTab(tab.id)}
             >
@@ -55,12 +73,9 @@ export function EditorPanel({ saveActiveTab }: EditorPanelProps) {
             </button>
           ))}
         </div>
-        <Button className="ml-2" onClick={() => void saveActiveTab()}>
-          Save
-        </Button>
       </div>
 
-      <div className="flex-1">
+      <div className="flex-1 overflow-hidden">
         {activeTab ? (
           <MonacoEditor
             height="100%"
@@ -77,7 +92,10 @@ export function EditorPanel({ saveActiveTab }: EditorPanelProps) {
             onChange={(next) => updateTab(activeTab.id, next ?? "", true)}
           />
         ) : (
-          <div className="flex h-full items-center justify-center text-sm text-muted">Open a file from Explorer.</div>
+          <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-muted">
+            <div className="text-[13px] text-text">No file selected</div>
+            <div className="text-[11px]">Use the Explorer on the left to open a file.</div>
+          </div>
         )}
       </div>
     </div>
