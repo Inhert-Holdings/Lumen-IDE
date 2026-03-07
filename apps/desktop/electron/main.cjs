@@ -445,6 +445,76 @@ function resolvePreviewFile(rootPath, entryFile, requestPath) {
   return "";
 }
 
+function injectPreviewReloadClient(html) {
+  const snippet = `
+<script>
+(() => {
+  if (window.__lumenLiveReload) return;
+  window.__lumenLiveReload = true;
+  try {
+    const events = new EventSource("/__lumen_events");
+    events.onmessage = (event) => {
+      if (event?.data === "reload") {
+        window.location.reload();
+      }
+    };
+    window.addEventListener("beforeunload", () => events.close(), { once: true });
+  } catch (_error) {
+    // Ignore live reload transport failures.
+  }
+})();
+</script>
+`;
+
+  if (html.includes("</body>")) {
+    return html.replace("</body>", `${snippet}</body>`);
+  }
+  return `${html}\n${snippet}`;
+}
+
+function notifyPreviewClients(runtime, payload) {
+  if (!runtime?.clients?.size) return;
+  for (const client of Array.from(runtime.clients)) {
+    try {
+      client.write(`data: ${payload}\n\n`);
+    } catch {
+      runtime.clients.delete(client);
+      try {
+        client.end();
+      } catch {
+        // Ignore socket close errors.
+      }
+    }
+  }
+}
+
+function queuePreviewReload(runtime) {
+  if (!runtime) return;
+  if (runtime.reloadTimer) {
+    clearTimeout(runtime.reloadTimer);
+  }
+  runtime.reloadTimer = setTimeout(() => {
+    runtime.reloadTimer = null;
+    notifyPreviewClients(runtime, "reload");
+  }, 160);
+}
+
+function watchPreviewRoot(rootPath, runtime) {
+  try {
+    const watcher = fs.watch(rootPath, { recursive: true }, (_eventType, fileName) => {
+      const changed = String(fileName || "");
+      if (!changed || changed.startsWith(".git")) return;
+      queuePreviewReload(runtime);
+    });
+    watcher.on("error", () => {
+      // Ignore watcher transport errors.
+    });
+    return watcher;
+  } catch {
+    return null;
+  }
+}
+
 async function listenOnPort(server, port) {
   return await new Promise((resolve, reject) => {
     const onError = (error) => {
@@ -518,6 +588,24 @@ async function stopPreviewServer(reason = "manual") {
   const runtime = previewRuntime;
   previewRuntime = null;
 
+  if (runtime.reloadTimer) {
+    clearTimeout(runtime.reloadTimer);
+  }
+  if (runtime.watcher) {
+    try {
+      runtime.watcher.close();
+    } catch {
+      // Ignore watcher close errors.
+    }
+  }
+  for (const client of Array.from(runtime.clients || [])) {
+    try {
+      client.end();
+    } catch {
+      // Ignore socket close errors.
+    }
+  }
+
   await new Promise((resolve) => runtime.server.close(() => resolve()));
   audit("preview.stop", { reason, port: runtime.port, rootPath: runtime.rootPath });
 
@@ -532,11 +620,36 @@ async function startPreviewServer(payload = {}) {
     await stopPreviewServer("restart");
   }
 
+  const runtimeState = {
+    clients: new Set(),
+    watcher: null,
+    reloadTimer: null,
+    server: null,
+    port: 0,
+    rootPath,
+    entryFile,
+    startedAt: ""
+  };
+
   const server = http.createServer((request, response) => {
     const requestUrl = new URL(request.url || "/", "http://127.0.0.1");
     if (requestUrl.pathname === "/__lumen_health") {
       response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       response.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    if (requestUrl.pathname === "/__lumen_events") {
+      response.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-store",
+        Connection: "keep-alive"
+      });
+      response.write("retry: 1000\n\n");
+      runtimeState.clients.add(response);
+      request.on("close", () => {
+        runtimeState.clients.delete(response);
+      });
       return;
     }
 
@@ -548,11 +661,23 @@ async function startPreviewServer(payload = {}) {
       return;
     }
 
-    response.writeHead(200, {
-      "Content-Type": contentTypeFor(targetFile),
-      "Cache-Control": "no-store"
-    });
+    const contentType = contentTypeFor(targetFile);
+    if (contentType.startsWith("text/html")) {
+      try {
+        const html = fs.readFileSync(targetFile, "utf8");
+        response.writeHead(200, {
+          "Content-Type": contentType,
+          "Cache-Control": "no-store"
+        });
+        response.end(injectPreviewReloadClient(html));
+      } catch {
+        response.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+        response.end("Preview read error");
+      }
+      return;
+    }
 
+    response.writeHead(200, { "Content-Type": contentType, "Cache-Control": "no-store" });
     const stream = fs.createReadStream(targetFile);
     stream.on("error", () => {
       response.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
@@ -562,13 +687,11 @@ async function startPreviewServer(payload = {}) {
   });
 
   const port = await bindPreviewServer(server, preferredPort);
-  previewRuntime = {
-    server,
-    port,
-    rootPath,
-    entryFile,
-    startedAt: new Date().toISOString()
-  };
+  runtimeState.server = server;
+  runtimeState.port = port;
+  runtimeState.watcher = watchPreviewRoot(rootPath, runtimeState);
+  runtimeState.startedAt = new Date().toISOString();
+  previewRuntime = runtimeState;
 
   audit("preview.start", { rootPath, entryFile, port });
   return getPreviewStatus();

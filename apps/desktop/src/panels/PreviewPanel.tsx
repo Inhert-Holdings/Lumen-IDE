@@ -126,6 +126,7 @@ export function PreviewPanel() {
               <a className="text-accent underline" href={activeUrl} target="_blank" rel="noreferrer">
                 {activeUrl}
               </a>
+              {status.running && <span> · Live reload enabled</span>}
             </>
           ) : (
             "Preview is stopped."
