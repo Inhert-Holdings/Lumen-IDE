@@ -24,9 +24,8 @@ body,
   width: 100%;
   height: 100%;
   background:
-    radial-gradient(circle at 10% -10%, rgba(39, 113, 197, 0.22) 0%, rgba(39, 113, 197, 0) 28%),
-    radial-gradient(circle at 110% 10%, rgba(16, 185, 129, 0.12) 0%, rgba(16, 185, 129, 0) 20%),
-    linear-gradient(180deg, #0e1420 0%, #0b1018 48%, #090d14 100%);
+    radial-gradient(circle at 15% -10%, rgba(39, 113, 197, 0.14) 0%, rgba(39, 113, 197, 0) 26%),
+    linear-gradient(180deg, #0d121a 0%, #0a0f17 100%);
 }
 
 .compact {
@@ -66,10 +65,10 @@ body,
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  height: 24px;
+  height: 22px;
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
-  padding: 0 10px;
-  color: #9db0c9;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.025);
+  padding: 0 9px;
+  color: #91a3ba;
 }

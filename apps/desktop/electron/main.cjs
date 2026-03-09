@@ -6,6 +6,7 @@ const { randomUUID } = require("node:crypto");
 
 const { app, BrowserWindow, dialog, ipcMain, safeStorage } = require("electron");
 const pty = require("node-pty");
+const { chromium } = require("playwright-core");
 const simpleGit = require("simple-git");
 
 const APP_ROOT = path.resolve(__dirname, "..");
@@ -18,16 +19,25 @@ const MAX_TREE_ENTRIES = 6000;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const PREVIEW_DEFAULT_PORT = 4173;
 const PREVIEW_MAX_PORT_ATTEMPTS = 25;
+const PREVIEW_PROJECT_WAIT_MS = 30000;
+const PREVIEW_DIAGNOSTIC_LIMIT = 40;
 const EXCLUDED_DIRS = new Set([".git", "node_modules", "dist", "release", ".idea", ".vscode"]);
 
 const DEFAULT_SETTINGS = {
   provider: "ollama",
   baseUrl: "http://localhost:11434/v1",
   model: "qwen2.5-coder:7b",
+  helperEnabled: true,
+  helperUsesMainConnection: true,
+  helperProvider: "ollama",
+  helperBaseUrl: "http://localhost:11434/v1",
+  helperModel: "qwen2.5-coder:1.5b",
   onlineMode: false,
   compactMode: true,
   recentModels: ["Qwen2.5-Coder-7B-Instruct", "qwen2.5-coder:7b"],
+  helperRecentModels: ["Qwen2.5-Coder-1.5B-Instruct", "qwen2.5-coder:1.5b", "qwen2.5-coder:7b"],
   apiKey: "",
+  helperApiKey: "",
   autoManageLocalRuntime: true,
   autoStopMinutes: 10
 };
@@ -41,6 +51,8 @@ let managedRuntime = null;
 let runtimeIdleTimer = null;
 let lastRuntimeActivityAt = 0;
 let previewRuntime = null;
+let previewProjectRuntime = null;
+let previewBrowserRuntime = null;
 
 function getUserDataPath(filename) {
   return path.join(app.getPath("userData"), filename);
@@ -156,7 +168,8 @@ function loadSettings() {
   return {
     ...DEFAULT_SETTINGS,
     ...stored,
-    apiKey: decryptSecret(stored.apiKeyEnc || "")
+    apiKey: decryptSecret(stored.apiKeyEnc || ""),
+    helperApiKey: decryptSecret(stored.helperApiKeyEnc || "")
   };
 }
 
@@ -166,12 +179,15 @@ function saveSettings(input) {
     ...DEFAULT_SETTINGS,
     ...input,
     autoStopMinutes: Math.max(1, Number(input.autoStopMinutes) || DEFAULT_SETTINGS.autoStopMinutes),
-    recentModels: Array.from(new Set([input.model, ...(input.recentModels || [])].filter(Boolean))).slice(0, 10)
+    recentModels: Array.from(new Set([input.model, ...(input.recentModels || [])].filter(Boolean))).slice(0, 10),
+    helperRecentModels: Array.from(new Set([input.helperModel, ...(input.helperRecentModels || [])].filter(Boolean))).slice(0, 10)
   };
   const persisted = {
     ...next,
     apiKey: undefined,
-    apiKeyEnc: encryptSecret(next.apiKey || "")
+    helperApiKey: undefined,
+    apiKeyEnc: encryptSecret(next.apiKey || ""),
+    helperApiKeyEnc: encryptSecret(next.helperApiKey || "")
   };
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
   fs.writeFileSync(settingsPath, JSON.stringify(persisted, null, 2), "utf8");
@@ -180,7 +196,14 @@ function saveSettings(input) {
   } else {
     scheduleManagedRuntimeStop();
   }
-  audit("settings.save", { provider: next.provider, baseUrl: next.baseUrl, model: next.model, onlineMode: next.onlineMode });
+  audit("settings.save", {
+    provider: next.provider,
+    baseUrl: next.baseUrl,
+    model: next.model,
+    helperEnabled: next.helperEnabled,
+    helperModel: next.helperModel,
+    onlineMode: next.onlineMode
+  });
   return next;
 }
 
@@ -560,23 +583,551 @@ async function bindPreviewServer(server, preferredPort) {
   return address.port;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function detectPackageManager(rootPath) {
+  if (fs.existsSync(path.join(rootPath, "pnpm-lock.yaml"))) return "pnpm";
+  if (fs.existsSync(path.join(rootPath, "yarn.lock"))) return "yarn";
+  if (fs.existsSync(path.join(rootPath, "package-lock.json"))) return "npm";
+  return "npm";
+}
+
+function resolveInspectionRoot(inputPath = "") {
+  const resolvedInput = inputPath
+    ? safeResolve(path.isAbsolute(inputPath) ? inputPath : path.join(workspaceRoot, inputPath))
+    : workspaceRoot;
+
+  if (!fs.existsSync(resolvedInput)) {
+    throw new Error("Project path does not exist.");
+  }
+
+  const stat = fs.statSync(resolvedInput);
+  return stat.isFile() ? path.dirname(resolvedInput) : resolvedInput;
+}
+
+function readTextIfExists(filePath) {
+  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) return "";
+  return fs.readFileSync(filePath, "utf8");
+}
+
+function readJsonIfExists(filePath) {
+  const raw = readTextIfExists(filePath);
+  return raw ? safeJsonParse(raw, null) : null;
+}
+
+function relativeWorkspacePath(targetPath) {
+  if (!targetPath) return "";
+  const relative = path.relative(workspaceRoot, targetPath);
+  if (!relative) return ".";
+  return relative.replace(/\\/g, "/");
+}
+
+function buildScriptCommand(packageManager, scriptName) {
+  return packageManager === "yarn" ? `yarn ${scriptName}` : `${packageManager} ${scriptName}`;
+}
+
+function inferPreviewUrl(scriptName, scriptText, preferredUrl, preferredPort) {
+  const explicitUrl = String(preferredUrl || "").trim();
+  if (explicitUrl) return explicitUrl;
+
+  const explicitPort = Number(preferredPort) || 0;
+  if (explicitPort > 0) return `http://127.0.0.1:${explicitPort}`;
+
+  const normalized = String(scriptText || "");
+  const portMatch = normalized.match(/(?:--port|-p)\s+(\d{2,5})/i) || normalized.match(/PORT\s*=\s*(\d{2,5})/i);
+  if (portMatch?.[1]) {
+    return `http://127.0.0.1:${portMatch[1]}`;
+  }
+
+  const lower = normalized.toLowerCase();
+  if (scriptName === "preview" || lower.includes("vite preview")) {
+    return `http://127.0.0.1:${PREVIEW_DEFAULT_PORT}`;
+  }
+  if (lower.includes("vite")) {
+    return "http://127.0.0.1:5173";
+  }
+  if (lower.includes("next")) {
+    return "http://127.0.0.1:3000";
+  }
+  return "http://127.0.0.1:3000";
+}
+
+function detectNodeFramework(packageJson, scripts) {
+  const dependencyNames = new Set([
+    ...Object.keys(packageJson?.dependencies || {}),
+    ...Object.keys(packageJson?.devDependencies || {})
+  ]);
+  const scriptBlob = Object.values(scripts)
+    .map((value) => String(value || ""))
+    .join("\n")
+    .toLowerCase();
+
+  if (dependencyNames.has("next") || scriptBlob.includes("next dev")) {
+    return { framework: "Next.js", confidence: "high" };
+  }
+  if (dependencyNames.has("vite") || scriptBlob.includes("vite")) {
+    return { framework: "Vite", confidence: "high" };
+  }
+  if (dependencyNames.has("electron") || dependencyNames.has("electron-builder")) {
+    return { framework: "Electron", confidence: "high" };
+  }
+  if (dependencyNames.has("express")) {
+    return { framework: "Express", confidence: "medium" };
+  }
+  if (dependencyNames.has("react")) {
+    return { framework: "React", confidence: "medium" };
+  }
+  return { framework: "Node app", confidence: "low" };
+}
+
+function findStaticRoot(rootPath) {
+  const candidates = [rootPath, path.join(rootPath, "dist"), path.join(rootPath, "build"), path.join(rootPath, "public")];
+  for (const candidate of candidates) {
+    const entryPath = path.join(candidate, "index.html");
+    if (fs.existsSync(entryPath) && fs.statSync(entryPath).isFile()) {
+      return { rootPath: candidate, entryFile: "index.html" };
+    }
+  }
+  return { rootPath: "", entryFile: "" };
+}
+
+function inspectNodeProject(rootPath, packageJson) {
+  const scripts = packageJson?.scripts && typeof packageJson.scripts === "object" ? packageJson.scripts : {};
+  const packageManager = detectPackageManager(rootPath);
+  const orderedScripts = Object.entries(scripts)
+    .filter(([, command]) => typeof command === "string")
+    .map(([name, command]) => ({ name, command: String(command) }));
+  const detected = detectNodeFramework(packageJson, scripts);
+  const runScript = ["dev", "start", "preview"].find((candidate) => typeof scripts[candidate] === "string") || "";
+  const buildScript = typeof scripts.build === "string" ? "build" : "";
+  const staticTarget = findStaticRoot(rootPath);
+
+  return {
+    rootPath,
+    kind: "node",
+    framework: detected.framework,
+    confidence: detected.confidence,
+    packageManager,
+    scripts: orderedScripts,
+    runCommand: runScript ? buildScriptCommand(packageManager, runScript) : "",
+    buildCommand: buildScript ? buildScriptCommand(packageManager, buildScript) : "",
+    devUrl: runScript ? inferPreviewUrl(runScript, scripts[runScript], "", 0) : "",
+    staticRoot: staticTarget.rootPath,
+    entryFile: staticTarget.entryFile,
+    summary: runScript
+      ? `${detected.framework} project detected. Suggested run command: ${buildScriptCommand(packageManager, runScript)}`
+      : `${detected.framework} project detected. No runnable dev script found.`
+  };
+}
+
+function inspectPythonProject(rootPath) {
+  const requirementsText = readTextIfExists(path.join(rootPath, "requirements.txt"));
+  const pyprojectText = readTextIfExists(path.join(rootPath, "pyproject.toml"));
+  const combined = `${requirementsText}\n${pyprojectText}`.toLowerCase();
+
+  if (!combined.trim()) return null;
+
+  if (combined.includes("fastapi")) {
+    const entryModule = fs.existsSync(path.join(rootPath, "main.py")) ? "main:app" : "app:app";
+    return {
+      rootPath,
+      kind: "python",
+      framework: "FastAPI",
+      confidence: "medium",
+      packageManager: "python",
+      scripts: [],
+      runCommand: `uvicorn ${entryModule} --reload`,
+      buildCommand: "",
+      devUrl: "http://127.0.0.1:8000",
+      staticRoot: "",
+      entryFile: "",
+      summary: "FastAPI project detected. Suggested run command: uvicorn ..."
+    };
+  }
+
+  if (combined.includes("flask")) {
+    const entryFile = fs.existsSync(path.join(rootPath, "app.py")) ? "app.py" : "main.py";
+    return {
+      rootPath,
+      kind: "python",
+      framework: "Flask",
+      confidence: "medium",
+      packageManager: "python",
+      scripts: [],
+      runCommand: `flask --app ${entryFile} run --debug`,
+      buildCommand: "",
+      devUrl: "http://127.0.0.1:5000",
+      staticRoot: "",
+      entryFile: "",
+      summary: "Flask project detected. Suggested run command: flask --app ... run --debug"
+    };
+  }
+
+  return {
+    rootPath,
+    kind: "python",
+    framework: "Python app",
+    confidence: "low",
+    packageManager: "python",
+    scripts: [],
+    runCommand: "",
+    buildCommand: "",
+    devUrl: "",
+    staticRoot: "",
+    entryFile: "",
+    summary: "Python project detected, but no preview command could be inferred."
+  };
+}
+
+function inspectStaticProject(rootPath) {
+  const staticTarget = findStaticRoot(rootPath);
+  if (!staticTarget.rootPath) {
+    return {
+      rootPath,
+      kind: "unknown",
+      framework: "Unknown",
+      confidence: "low",
+      packageManager: "",
+      scripts: [],
+      runCommand: "",
+      buildCommand: "",
+      devUrl: "",
+      staticRoot: "",
+      entryFile: "",
+      summary: "No runnable project or static entry point detected yet."
+    };
+  }
+
+  return {
+    rootPath,
+    kind: "static",
+    framework: "Static HTML",
+    confidence: staticTarget.rootPath === rootPath ? "high" : "medium",
+    packageManager: "",
+    scripts: [],
+    runCommand: "",
+    buildCommand: "",
+    devUrl: "",
+    staticRoot: staticTarget.rootPath,
+    entryFile: staticTarget.entryFile,
+    summary: `Static preview available from ${relativeWorkspacePath(staticTarget.rootPath)}`
+  };
+}
+
+function inspectProject(payload = {}) {
+  const rootPath = resolveInspectionRoot(payload.path || "");
+  const packageJson = readJsonIfExists(path.join(rootPath, "package.json"));
+
+  if (packageJson) {
+    return inspectNodeProject(rootPath, packageJson);
+  }
+
+  const pythonProject = inspectPythonProject(rootPath);
+  if (pythonProject) return pythonProject;
+
+  return inspectStaticProject(rootPath);
+}
+
+function detectPreviewProject(payload = {}) {
+  const inspection = inspectProject(payload);
+  if (inspection.kind !== "node") {
+    throw new Error("Run Current Project currently supports package.json-based projects. Use Serve Static Folder otherwise.");
+  }
+
+  const preferredScript = String(payload.command || "").trim();
+  const selectedScript = preferredScript
+    ? inspection.scripts.find((script) => script.name === preferredScript)
+    : inspection.scripts.find((script) => ["dev", "start", "preview"].includes(script.name));
+  if (!selectedScript) {
+    throw new Error("No runnable project script found. Expected dev, start, or preview.");
+  }
+
+  return {
+    rootPath: inspection.rootPath,
+    packageManager: inspection.packageManager,
+    scriptName: selectedScript.name,
+    command: buildScriptCommand(inspection.packageManager, selectedScript.name),
+    url: inferPreviewUrl(selectedScript.name, selectedScript.command, payload.url, payload.port),
+    packagePath: path.join(inspection.rootPath, "package.json"),
+    inspection
+  };
+}
+
+function normalizeLocalPreviewUrl(rawUrl) {
+  if (!rawUrl) return "";
+  try {
+    const parsed = new URL(String(rawUrl).replace(/[),.;]+$/, ""));
+    if (!["http:", "https:"].includes(parsed.protocol)) return "";
+    if (!["127.0.0.1", "localhost", "0.0.0.0", "::1", "[::1]"].includes(parsed.hostname)) return "";
+    if (parsed.hostname !== "127.0.0.1") {
+      parsed.hostname = "127.0.0.1";
+    }
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function extractLocalPreviewUrls(text) {
+  const matches = String(text || "").match(/\bhttps?:\/\/(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(?::\d{2,5})?(?:\/[^\s"'`)]*)?/gi) || [];
+  return Array.from(new Set(matches.map((match) => normalizeLocalPreviewUrl(match)).filter(Boolean)));
+}
+
+function appendTerminalOutput(record, chunk) {
+  record.recentOutput = `${record.recentOutput || ""}${chunk}`.slice(-80000);
+  const detectedUrls = extractLocalPreviewUrls(chunk);
+  if (!detectedUrls.length) return;
+  record.recentUrls = Array.from(new Set([...(record.recentUrls || []), ...detectedUrls])).slice(-10);
+}
+
+async function waitForPreviewUrlInTerminal(record, preferredUrl, timeoutMs = PREVIEW_PROJECT_WAIT_MS) {
+  const startedAt = Date.now();
+  let lastError = "";
+  let currentUrl = normalizeLocalPreviewUrl(preferredUrl);
+
+  const onData = (chunk) => {
+    appendTerminalOutput(record, chunk);
+    const recentUrl = record.recentUrls?.at(-1) || "";
+    if (recentUrl) {
+      currentUrl = recentUrl;
+    }
+  };
+
+  record.collectors.add(onData);
+  try {
+    while (Date.now() - startedAt < timeoutMs) {
+      const candidates = Array.from(new Set([currentUrl, ...(record.recentUrls || [])].filter(Boolean)));
+      for (const candidate of candidates) {
+        try {
+          const response = await fetch(candidate, { method: "GET" });
+          if (response.ok || response.status < 500) {
+            return {
+              url: candidate,
+              detectedUrl: record.recentUrls?.at(-1) || candidate,
+              terminalOutput: (record.recentOutput || "").slice(-12000)
+            };
+          }
+          lastError = `HTTP ${response.status}`;
+        } catch (error) {
+          lastError = error instanceof Error ? error.message : "Preview URL did not respond";
+        }
+      }
+      await sleep(500);
+    }
+  } finally {
+    record.collectors.delete(onData);
+  }
+
+  throw new Error(
+    `Preview server did not become ready.${currentUrl ? ` Last expected URL: ${currentUrl}.` : ""} ${lastError}`.trim()
+  );
+}
+
+function getPreviewBrowserStatus() {
+  return {
+    connected: Boolean(previewBrowserRuntime?.page),
+    url: previewBrowserRuntime?.url || "",
+    title: previewBrowserRuntime?.title || "",
+    executable: previewBrowserRuntime?.executable || "",
+    consoleErrors: previewBrowserRuntime?.consoleErrors?.length || 0,
+    networkErrors: previewBrowserRuntime?.networkErrors?.length || 0,
+    lastConsoleError: previewBrowserRuntime?.consoleErrors?.at(-1) || "",
+    lastNetworkError: previewBrowserRuntime?.networkErrors?.at(-1) || ""
+  };
+}
+
+function findLocalBrowserExecutable() {
+  const candidates = process.platform === "win32"
+    ? [
+        "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+        "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"
+      ]
+    : [process.env.CHROME_BIN, process.env.BROWSER].filter(Boolean);
+
+  return candidates.find((candidate) => candidate && fs.existsSync(candidate)) || "";
+}
+
+function pushPreviewDiagnostic(target, value) {
+  target.push(String(value || "").trim());
+  if (target.length > PREVIEW_DIAGNOSTIC_LIMIT) {
+    target.splice(0, target.length - PREVIEW_DIAGNOSTIC_LIMIT);
+  }
+}
+
+async function ensurePreviewBrowser() {
+  if (previewBrowserRuntime?.browser) {
+    return previewBrowserRuntime;
+  }
+
+  const executablePath = findLocalBrowserExecutable();
+  if (!executablePath) {
+    throw new Error("No supported local browser found for Playwright. Install Microsoft Edge or Chrome.");
+  }
+
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath,
+    args: ["--disable-gpu", "--disable-dev-shm-usage"]
+  });
+  const context = await browser.newContext({
+    viewport: { width: 1440, height: 900 }
+  });
+  const page = await context.newPage();
+  previewBrowserRuntime = {
+    browser,
+    context,
+    page,
+    url: "",
+    title: "",
+    executable: executablePath,
+    consoleErrors: [],
+    networkErrors: []
+  };
+
+  page.on("console", (message) => {
+    if (message.type() === "error" && previewBrowserRuntime?.page === page) {
+      pushPreviewDiagnostic(previewBrowserRuntime.consoleErrors, message.text());
+    }
+  });
+  page.on("pageerror", (error) => {
+    if (previewBrowserRuntime?.page === page) {
+      pushPreviewDiagnostic(previewBrowserRuntime.consoleErrors, error.message);
+    }
+  });
+  page.on("requestfailed", (request) => {
+    if (previewBrowserRuntime?.page === page) {
+      const failure = request.failure()?.errorText || "request failed";
+      pushPreviewDiagnostic(previewBrowserRuntime.networkErrors, `${request.method()} ${request.url()} (${failure})`);
+    }
+  });
+
+  audit("preview.browser_open", { executablePath });
+  return previewBrowserRuntime;
+}
+
+async function closePreviewBrowser(reason = "manual") {
+  if (!previewBrowserRuntime?.browser) {
+    return getPreviewBrowserStatus();
+  }
+
+  const runtime = previewBrowserRuntime;
+  previewBrowserRuntime = null;
+  await runtime.browser.close();
+  audit("preview.browser_close", { reason, url: runtime.url });
+  return getPreviewBrowserStatus();
+}
+
+function currentPreviewUrl(fallbackUrl = "") {
+  if (fallbackUrl) return fallbackUrl;
+  if (previewProjectRuntime?.url) return previewProjectRuntime.url;
+  if (previewRuntime?.port) return `http://127.0.0.1:${previewRuntime.port}/`;
+  if (previewBrowserRuntime?.url) return previewBrowserRuntime.url;
+  return "";
+}
+
+async function connectPreviewBrowser(targetUrl = "") {
+  const url = currentPreviewUrl(targetUrl);
+  if (!url) {
+    throw new Error("No preview URL is active. Start a project or static preview first.");
+  }
+
+  assertRemoteAllowed(url);
+  const runtime = await ensurePreviewBrowser();
+  runtime.consoleErrors = [];
+  runtime.networkErrors = [];
+  await runtime.page.goto(url, { waitUntil: "domcontentloaded" });
+  runtime.url = url;
+  runtime.title = await runtime.page.title();
+  audit("preview.browser_connect", { url });
+  return { ...getPreviewBrowserStatus(), snapshot: await snapshotPreviewBrowser() };
+}
+
+async function snapshotPreviewBrowser() {
+  const runtime = previewBrowserRuntime?.page ? previewBrowserRuntime : await connectPreviewBrowser();
+  const title = await runtime.page.title();
+  const text = await runtime.page.evaluate(() => {
+    const bodyText = document.body?.innerText || "";
+    return bodyText.replace(/\s+\n/g, "\n").trim().slice(0, 5000);
+  });
+  runtime.title = title;
+  return {
+    url: runtime.url,
+    title,
+    text
+  };
+}
+
+async function clickPreviewBrowser(payload = {}) {
+  const runtime = previewBrowserRuntime?.page ? previewBrowserRuntime : await connectPreviewBrowser(payload.url || "");
+  const selector = String(payload.selector || "").trim();
+  if (!selector) throw new Error("A CSS selector is required for preview click.");
+  await runtime.page.click(selector);
+  runtime.title = await runtime.page.title();
+  audit("preview.browser_click", { selector, url: runtime.url });
+  return snapshotPreviewBrowser();
+}
+
+async function typePreviewBrowser(payload = {}) {
+  const runtime = previewBrowserRuntime?.page ? previewBrowserRuntime : await connectPreviewBrowser(payload.url || "");
+  const selector = String(payload.selector || "").trim();
+  if (!selector) throw new Error("A CSS selector is required for preview type.");
+  await runtime.page.fill(selector, String(payload.text || ""));
+  runtime.title = await runtime.page.title();
+  audit("preview.browser_type", { selector, url: runtime.url });
+  return snapshotPreviewBrowser();
+}
+
+async function pressPreviewBrowser(payload = {}) {
+  const runtime = previewBrowserRuntime?.page ? previewBrowserRuntime : await connectPreviewBrowser(payload.url || "");
+  const key = String(payload.key || "").trim();
+  if (!key) throw new Error("A key is required for preview press.");
+  await runtime.page.keyboard.press(key);
+  runtime.title = await runtime.page.title();
+  audit("preview.browser_press", { key, url: runtime.url });
+  return snapshotPreviewBrowser();
+}
+
 function getPreviewStatus() {
-  if (!previewRuntime) {
+  const browser = getPreviewBrowserStatus();
+  const isProject = Boolean(previewProjectRuntime);
+  const isStatic = Boolean(previewRuntime);
+
+  if (!isProject && !isStatic) {
     return {
       running: false,
+      mode: "idle",
       url: "",
       port: 0,
       rootPath: "",
-      entryFile: ""
+      entryFile: "",
+      projectPath: "",
+      projectCommand: "",
+      terminalId: "",
+      startedAt: "",
+      lastDetectedUrl: "",
+      inspection: inspectProject({}),
+      browser
     };
   }
 
   return {
     running: true,
-    url: `http://127.0.0.1:${previewRuntime.port}/`,
-    port: previewRuntime.port,
-    rootPath: previewRuntime.rootPath,
-    entryFile: previewRuntime.entryFile
+    mode: isProject ? "project" : "static",
+    url: isProject ? previewProjectRuntime.url : `http://127.0.0.1:${previewRuntime.port}/`,
+    port: isProject ? 0 : previewRuntime.port,
+    rootPath: isProject ? previewProjectRuntime.rootPath : previewRuntime.rootPath,
+    entryFile: isProject ? "" : previewRuntime.entryFile,
+    projectPath: previewProjectRuntime?.rootPath || "",
+    projectCommand: previewProjectRuntime?.command || "",
+    terminalId: previewProjectRuntime?.terminalId || "",
+    startedAt: isProject ? previewProjectRuntime.startedAt : previewRuntime.startedAt,
+    lastDetectedUrl: previewProjectRuntime?.lastDetectedUrl || "",
+    inspection: isProject ? previewProjectRuntime.inspection : previewRuntime.inspection,
+    browser
   };
 }
 
@@ -616,6 +1167,9 @@ async function startPreviewServer(payload = {}) {
   const { rootPath, entryFile } = resolvePreviewTarget(payload.path || "", payload.entry || "index.html");
   const preferredPort = Number(payload.port) || PREVIEW_DEFAULT_PORT;
 
+  if (previewProjectRuntime) {
+    await stopPreviewProject("switch_to_static");
+  }
   if (previewRuntime) {
     await stopPreviewServer("restart");
   }
@@ -628,7 +1182,8 @@ async function startPreviewServer(payload = {}) {
     port: 0,
     rootPath,
     entryFile,
-    startedAt: ""
+    startedAt: "",
+    inspection: inspectProject({ path: rootPath })
   };
 
   const server = http.createServer((request, response) => {
@@ -695,6 +1250,71 @@ async function startPreviewServer(payload = {}) {
 
   audit("preview.start", { rootPath, entryFile, port });
   return getPreviewStatus();
+}
+
+async function stopPreviewProject(reason = "manual") {
+  if (!previewProjectRuntime) {
+    return { ok: true, ...getPreviewStatus() };
+  }
+
+  const runtime = previewProjectRuntime;
+  previewProjectRuntime = null;
+  if (runtime.terminalId && terminals.has(runtime.terminalId)) {
+    try {
+      writeTerminal(runtime.terminalId, "\u0003");
+    } catch {
+      // Ignore terminal stop failures.
+    }
+  }
+  audit("preview.project_stop", { reason, rootPath: runtime.rootPath, command: runtime.command });
+  return { ok: true, ...getPreviewStatus() };
+}
+
+async function startPreviewProject(payload = {}) {
+  const project = detectPreviewProject(payload);
+  const terminalId = String(payload.terminalId || "").trim();
+  if (!terminalId || !terminals.has(terminalId)) {
+    throw new Error("Preview terminal is not available. Create a terminal first.");
+  }
+
+  await stopPreviewServer("switch_to_project");
+  if (previewProjectRuntime) {
+    await stopPreviewProject("restart");
+  }
+
+  const terminalRecord = terminals.get(terminalId);
+  if (!terminalRecord) {
+    throw new Error("Preview terminal closed before the project could start.");
+  }
+  terminalRecord.recentOutput = "";
+  terminalRecord.recentUrls = [];
+
+  writeTerminal(terminalId, `\u0003`);
+  await sleep(200);
+  writeTerminal(terminalId, `${project.command}\r`);
+  const readiness = await waitForPreviewUrlInTerminal(terminalRecord, project.url);
+
+  previewProjectRuntime = {
+    ...project,
+    url: readiness.url,
+    terminalId,
+    startedAt: new Date().toISOString(),
+    lastDetectedUrl: readiness.detectedUrl || readiness.url
+  };
+  audit("preview.project_start", {
+    rootPath: project.rootPath,
+    command: project.command,
+    url: readiness.url,
+    terminalId
+  });
+  return getPreviewStatus();
+}
+
+async function stopPreview(reason = "manual") {
+  await stopPreviewServer(reason);
+  await stopPreviewProject(reason);
+  await closePreviewBrowser(reason);
+  return { ok: true, ...getPreviewStatus() };
 }
 
 function isLocalUrl(baseUrl) {
@@ -1291,59 +1911,158 @@ function stopLlmStream(requestId) {
   return { ok: true };
 }
 
+function emitTerminalData(id, data) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("terminal:data", { id, data });
+  }
+}
+
 function createTerminal({ cols = 120, rows = 30 } = {}) {
   const id = `term-${++terminalCounter}`;
   const shell = process.platform === "win32" ? "powershell.exe" : process.env.SHELL || "bash";
 
-  const terminal = pty.spawn(shell, [], {
+  const ptyProcess = pty.spawn(shell, [], {
     name: "xterm-256color",
     cols,
     rows,
     cwd: workspaceRoot,
     env: process.env
   });
+  const record = {
+    id,
+    shell,
+    cwd: workspaceRoot,
+    pty: ptyProcess,
+    collectors: new Set(),
+    queue: Promise.resolve(),
+    recentOutput: "",
+    recentUrls: []
+  };
 
-  terminal.onData((data) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("terminal:data", { id, data });
+  ptyProcess.onData((data) => {
+    appendTerminalOutput(record, data);
+    emitTerminalData(id, data);
+    for (const collector of Array.from(record.collectors)) {
+      try {
+        collector(data);
+      } catch {
+        record.collectors.delete(collector);
+      }
     }
   });
 
-  terminal.onExit(({ exitCode }) => {
+  ptyProcess.onExit(({ exitCode }) => {
     terminals.delete(id);
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send("terminal:exit", { id, exitCode });
     }
   });
 
-  terminals.set(id, terminal);
+  terminals.set(id, record);
   audit("terminal.create", { id, shell, cwd: workspaceRoot });
   return { id, shell, cwd: workspaceRoot };
 }
 
 function listTerminals() {
-  return Array.from(terminals.keys()).map((id) => ({ id }));
+  return Array.from(terminals.values()).map((terminal) => ({ id: terminal.id }));
 }
 
 function writeTerminal(id, data) {
   const terminal = terminals.get(id);
   if (!terminal) throw new Error("Terminal not found.");
-  terminal.write(data);
+  terminal.pty.write(data);
 }
 
 function resizeTerminal(id, cols, rows) {
   const terminal = terminals.get(id);
   if (!terminal) throw new Error("Terminal not found.");
-  terminal.resize(Math.max(40, cols), Math.max(6, rows));
+  terminal.pty.resize(Math.max(40, cols), Math.max(6, rows));
 }
 
 function killTerminal(id) {
   const terminal = terminals.get(id);
   if (!terminal) return { ok: true };
-  terminal.kill();
+  terminal.pty.kill();
   terminals.delete(id);
   audit("terminal.kill", { id });
   return { ok: true };
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function runCommandInTerminal(record, command) {
+  const token = randomUUID().replace(/-/g, "");
+  const startToken = `__LUMEN_START_${token}__`;
+  const exitTokenPattern = new RegExp(`${escapeRegExp(`__LUMEN_EXIT_${token}_`)}(-?\\d+)__`);
+  const shellCommand = process.platform === "win32"
+    ? [
+        "$__lumenCode = 0",
+        `Write-Output '${startToken}'`,
+        "try {",
+        command,
+        "  if (-not $?) {",
+        "    $__lumenCode = if ($LASTEXITCODE -is [int]) { $LASTEXITCODE } else { 1 }",
+        "  } elseif ($LASTEXITCODE -is [int]) {",
+        "    $__lumenCode = $LASTEXITCODE",
+        "  }",
+        "} catch {",
+        "  Write-Error $_",
+        "  $__lumenCode = 1",
+        "}",
+        `Write-Output \"__LUMEN_EXIT_${token}_$__lumenCode__\"`
+      ].join("\r\n")
+    : [`printf '${startToken}\\n'`, command, `printf '__LUMEN_EXIT_${token}_%s__\\n' \"$?\"`].join("\n");
+
+  const previous = record.queue.catch(() => {});
+  const next = previous.then(
+    () =>
+      new Promise((resolve, reject) => {
+        let buffer = "";
+        let started = false;
+        let output = "";
+        let onData = null;
+        const timeout = setTimeout(() => {
+          if (onData) record.collectors.delete(onData);
+          reject(new Error("Terminal command timed out."));
+        }, 10 * 60 * 1000);
+
+        const finish = (code) => {
+          clearTimeout(timeout);
+          if (onData) record.collectors.delete(onData);
+          resolve({
+            code,
+            stdout: output.replace(/\r/g, "").trim(),
+            stderr: ""
+          });
+        };
+
+        onData = (chunk) => {
+          buffer += chunk;
+          if (!started) {
+            const startIndex = buffer.indexOf(startToken);
+            if (startIndex === -1) {
+              buffer = buffer.slice(-4000);
+              return;
+            }
+            started = true;
+            buffer = buffer.slice(startIndex + startToken.length);
+          }
+
+          const match = exitTokenPattern.exec(buffer);
+          if (!match || match.index === undefined) return;
+
+          output += buffer.slice(0, match.index);
+          finish(Number(match[1] || 1));
+        };
+
+        record.collectors.add(onData);
+        record.pty.write(`${shellCommand}\r`);
+      })
+  );
+  record.queue = next.catch(() => {});
+  return next;
 }
 
 function disallowUnsafeCommand(command) {
@@ -1357,9 +2076,18 @@ function disallowUnsafeCommand(command) {
   }
 }
 
-async function runCommand(command) {
+async function runCommand(command, options = {}) {
   disallowUnsafeCommand(command);
-  audit("agent.run_cmd", { command });
+  audit("agent.run_cmd", { command, terminalId: options.terminalId || "" });
+
+  if (options.terminalId) {
+    const record = terminals.get(options.terminalId);
+    if (!record) {
+      throw new Error("Target terminal not found.");
+    }
+    emitTerminalData(options.terminalId, `\r\n> ${command}\r\n`);
+    return runCommandInTerminal(record, command);
+  }
 
   const shell = process.platform === "win32" ? "powershell.exe" : process.env.SHELL || "bash";
   const args = process.platform === "win32"
@@ -1495,7 +2223,7 @@ ipcMain.handle("workspace:openFolder", async () => {
 
   workspaceRoot = path.resolve(result.filePaths[0]);
   saveWorkspaceRoot(workspaceRoot);
-  await stopPreviewServer("workspace_changed");
+  await stopPreview("workspace_changed");
   audit("workspace.open", { root: workspaceRoot });
 
   for (const terminalId of Array.from(terminals.keys())) {
@@ -1515,6 +2243,7 @@ ipcMain.handle("files:mkdir", async (_event, payload) => createDirectory(payload
 ipcMain.handle("files:rename", async (_event, payload) => renamePath(payload.path, payload.nextPath));
 ipcMain.handle("files:delete", async (_event, payload) => deletePath(payload.path));
 ipcMain.handle("files:search", async (_event, payload) => ({ results: searchFiles(payload.query, payload.maxResults) }));
+ipcMain.handle("workspace:inspect", async (_event, payload) => inspectProject(payload || {}));
 
 ipcMain.handle("terminal:create", async (_event, payload) => createTerminal(payload || {}));
 ipcMain.handle("terminal:list", async () => ({ terminals: listTerminals() }));
@@ -1540,10 +2269,17 @@ ipcMain.handle("llm:startStream", async (event, payload) => {
 });
 ipcMain.handle("llm:abortStream", async (_event, payload) => stopLlmStream(payload.requestId));
 
-ipcMain.handle("agent:runCmd", async (_event, payload) => runCommand(payload.command));
+ipcMain.handle("agent:runCmd", async (_event, payload) => runCommand(payload.command, { terminalId: payload?.terminalId || "" }));
 ipcMain.handle("preview:status", async () => getPreviewStatus());
 ipcMain.handle("preview:start", async (_event, payload) => startPreviewServer(payload || {}));
-ipcMain.handle("preview:stop", async () => stopPreviewServer("manual"));
+ipcMain.handle("preview:startProject", async (_event, payload) => startPreviewProject(payload || {}));
+ipcMain.handle("preview:stop", async () => stopPreview("manual"));
+ipcMain.handle("preview:browserConnect", async (_event, payload) => connectPreviewBrowser(payload?.url || ""));
+ipcMain.handle("preview:browserSnapshot", async () => snapshotPreviewBrowser());
+ipcMain.handle("preview:browserClick", async (_event, payload) => clickPreviewBrowser(payload || {}));
+ipcMain.handle("preview:browserType", async (_event, payload) => typePreviewBrowser(payload || {}));
+ipcMain.handle("preview:browserPress", async (_event, payload) => pressPreviewBrowser(payload || {}));
+ipcMain.handle("preview:browserClose", async () => closePreviewBrowser("manual"));
 
 ipcMain.handle("git:status", async () => gitStatus());
 ipcMain.handle("git:diff", async (_event, payload) => gitDiff(payload?.path || "", Boolean(payload?.staged)));
@@ -1572,13 +2308,13 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => {
+  void stopPreview("app_exit");
   for (const terminalId of Array.from(terminals.keys())) {
     killTerminal(terminalId);
   }
   for (const controller of llmStreams.values()) {
     controller.abort();
   }
-  void stopPreviewServer("app_exit");
   stopManagedRuntime("app_exit");
   if (process.platform !== "darwin") {
     app.quit();

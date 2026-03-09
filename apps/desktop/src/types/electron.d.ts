@@ -11,11 +11,18 @@ export type LlmSettings = {
   baseUrl: string;
   model: string;
   apiKey: string;
+  helperEnabled: boolean;
+  helperUsesMainConnection: boolean;
+  helperProvider: "lmstudio" | "ollama" | "custom";
+  helperBaseUrl: string;
+  helperModel: string;
+  helperApiKey: string;
   onlineMode: boolean;
   compactMode: boolean;
   autoManageLocalRuntime: boolean;
   autoStopMinutes: number;
   recentModels: string[];
+  helperRecentModels: string[];
 };
 
 export type AuditEntry = {
@@ -23,6 +30,52 @@ export type AuditEntry = {
   timestamp: string;
   action: string;
   detail: Record<string, unknown>;
+};
+
+export type ProjectInspection = {
+  rootPath: string;
+  kind: "node" | "python" | "static" | "unknown";
+  framework: string;
+  confidence: "high" | "medium" | "low";
+  packageManager: string;
+  scripts: Array<{ name: string; command: string }>;
+  runCommand: string;
+  buildCommand: string;
+  devUrl: string;
+  staticRoot: string;
+  entryFile: string;
+  summary: string;
+};
+
+export type PreviewStatus = {
+  running: boolean;
+  mode: "idle" | "static" | "project";
+  url: string;
+  port: number;
+  rootPath: string;
+  entryFile: string;
+  projectPath: string;
+  projectCommand: string;
+  terminalId: string;
+  startedAt: string;
+  lastDetectedUrl: string;
+  inspection: ProjectInspection;
+  browser: {
+    connected: boolean;
+    url: string;
+    title: string;
+    executable: string;
+    consoleErrors: number;
+    networkErrors: number;
+    lastConsoleError: string;
+    lastNetworkError: string;
+  };
+};
+
+export type PreviewSnapshot = {
+  url: string;
+  title: string;
+  text: string;
 };
 
 declare global {
@@ -39,6 +92,7 @@ declare global {
         rename: (payload: { path: string; nextPath: string }) => Promise<{ ok: boolean }>;
         delete: (payload: { path: string }) => Promise<{ ok: boolean }>;
         search: (payload: { query: string; maxResults?: number }) => Promise<{ results: Array<{ path: string; line: number; preview: string }> }>;
+        inspect: (payload?: { path?: string }) => Promise<ProjectInspection>;
       };
       terminal: {
         create: (payload?: { cols?: number; rows?: number }) => Promise<{ id: string; shell: string; cwd: string }>;
@@ -89,25 +143,48 @@ declare global {
         onStatus: (listener: (payload: { requestId: string; message: string; modelUsed?: string }) => void) => () => void;
       };
       agent: {
-        runCmd: (payload: { command: string }) => Promise<{ code: number; stdout: string; stderr: string }>;
+        runCmd: (payload: { command: string; terminalId?: string }) => Promise<{ code: number; stdout: string; stderr: string }>;
       };
       preview: {
-        status: () => Promise<{ running: boolean; url: string; port: number; rootPath: string; entryFile: string }>;
+        status: () => Promise<PreviewStatus>;
         start: (payload?: { path?: string; entry?: string; port?: number }) => Promise<{
           running: boolean;
+          mode: "idle" | "static" | "project";
           url: string;
           port: number;
           rootPath: string;
           entryFile: string;
+          projectPath: string;
+          projectCommand: string;
+          terminalId: string;
+          startedAt: string;
+          lastDetectedUrl: string;
+          inspection: ProjectInspection;
+          browser: {
+            connected: boolean;
+            url: string;
+            title: string;
+            executable: string;
+            consoleErrors: number;
+            networkErrors: number;
+            lastConsoleError: string;
+            lastNetworkError: string;
+          };
         }>;
-        stop: () => Promise<{
-          ok: boolean;
-          running: boolean;
+        startProject: (payload?: { path?: string; command?: string; url?: string; port?: number; terminalId?: string }) => Promise<PreviewStatus>;
+        stop: () => Promise<{ ok: boolean } & PreviewStatus>;
+        browserConnect: (payload?: { url?: string }) => Promise<{
+          connected: boolean;
           url: string;
-          port: number;
-          rootPath: string;
-          entryFile: string;
+          title: string;
+          executable: string;
+          snapshot: PreviewSnapshot;
         }>;
+        browserSnapshot: () => Promise<PreviewSnapshot>;
+        browserClick: (payload: { selector: string; url?: string }) => Promise<PreviewSnapshot>;
+        browserType: (payload: { selector: string; text: string; url?: string }) => Promise<PreviewSnapshot>;
+        browserPress: (payload: { key: string; url?: string }) => Promise<PreviewSnapshot>;
+        browserClose: () => Promise<{ connected: boolean; url: string; title: string; executable: string }>;
       };
       audit: {
         list: () => Promise<{ entries: AuditEntry[] }>;

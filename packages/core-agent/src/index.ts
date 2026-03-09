@@ -7,6 +7,12 @@ export type ActionType =
   | "write_file"
   | "delete_file"
   | "run_cmd"
+  | "preview_start"
+  | "preview_status"
+  | "preview_snapshot"
+  | "preview_click"
+  | "preview_type"
+  | "preview_press"
   | "git_status"
   | "git_diff"
   | "git_stage"
@@ -24,6 +30,12 @@ export type AgentAction = {
   message?: string;
   paths?: string[];
   staged?: boolean;
+  entry?: string;
+  url?: string;
+  selector?: string;
+  text?: string;
+  key?: string;
+  port?: number;
 };
 
 export type PermissionRequirement = {
@@ -105,6 +117,13 @@ export function permissionForAction(action: AgentAction): PermissionRequirement 
         : "run_cmd is not in read-only allowlist"
     };
   }
+  if (action.type === "preview_start") {
+    return {
+      approvalRequired: true,
+      onlineRequired: false,
+      reason: "preview_start may launch a local dev server command"
+    };
+  }
   if (action.type === "git_commit") {
     return { approvalRequired: true, onlineRequired: false, reason: "git_commit requires approval" };
   }
@@ -169,6 +188,12 @@ function validateAction(action: unknown): AgentAction {
     "write_file",
     "delete_file",
     "run_cmd",
+    "preview_start",
+    "preview_status",
+    "preview_snapshot",
+    "preview_click",
+    "preview_type",
+    "preview_press",
     "git_status",
     "git_diff",
     "git_stage",
@@ -190,7 +215,13 @@ function validateAction(action: unknown): AgentAction {
     command: typeof candidate.command === "string" ? candidate.command : undefined,
     message: typeof candidate.message === "string" ? candidate.message : undefined,
     paths: Array.isArray(candidate.paths) ? candidate.paths.filter((item): item is string => typeof item === "string") : undefined,
-    staged: typeof candidate.staged === "boolean" ? candidate.staged : undefined
+    staged: typeof candidate.staged === "boolean" ? candidate.staged : undefined,
+    entry: typeof candidate.entry === "string" ? candidate.entry : undefined,
+    url: typeof candidate.url === "string" ? candidate.url : undefined,
+    selector: typeof candidate.selector === "string" ? candidate.selector : undefined,
+    text: typeof candidate.text === "string" ? candidate.text : undefined,
+    key: typeof candidate.key === "string" ? candidate.key : undefined,
+    port: typeof candidate.port === "number" ? candidate.port : undefined
   };
 }
 

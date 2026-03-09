@@ -1,7 +1,7 @@
 import { create } from "zustand";
 
 import { defaultLlmConfig, type LlmConfig } from "@lumen/llm-client";
-import type { AuditEntry, WorkspaceNode } from "@/types/electron";
+import type { AuditEntry, ProjectInspection, WorkspaceNode } from "@/types/electron";
 
 export type EditorTab = {
   id: string;
@@ -24,7 +24,45 @@ export type PendingAgentChange = {
   nextContent: string;
 };
 
-type RightPanelTab = "agent" | "preview" | "git" | "settings" | "audit";
+export type TimelineEntry = {
+  id: string;
+  timestamp: string;
+  phase: "understand" | "scope" | "plan" | "execute" | "verify" | "recover" | "propose" | "apply" | "runtime";
+  status: "info" | "running" | "done" | "failed" | "blocked";
+  title: string;
+  detail: string;
+  source: "agent" | "preview" | "terminal" | "git" | "workbench" | "system";
+};
+
+export type SessionMemory = {
+  currentGoal: string;
+  projectType: string;
+  detectedScripts: string[];
+  activePreviewUrl: string;
+  currentBranch: string;
+  terminalSessionIds: string[];
+  lastFailedCommand: string;
+  knownBlockers: string[];
+  filesTouched: string[];
+  verificationStatus: "idle" | "pending" | "passed" | "failed" | "skipped";
+  previewMode: "idle" | "static" | "project";
+};
+
+export type RightPanelTab = "agent" | "timeline" | "preview" | "git" | "settings" | "audit";
+
+const defaultSessionMemory = (): SessionMemory => ({
+  currentGoal: "",
+  projectType: "",
+  detectedScripts: [],
+  activePreviewUrl: "",
+  currentBranch: "",
+  terminalSessionIds: [],
+  lastFailedCommand: "",
+  knownBlockers: [],
+  filesTouched: [],
+  verificationStatus: "idle",
+  previewMode: "idle"
+});
 
 type AppState = {
   workspaceRoot: string;
@@ -41,6 +79,9 @@ type AppState = {
   settings: LlmConfig;
   audit: AuditEntry[];
   pendingChanges: PendingAgentChange[];
+  projectInspection: ProjectInspection | null;
+  sessionMemory: SessionMemory;
+  timeline: TimelineEntry[];
   setWorkspace: (root: string, tree: WorkspaceNode | null) => void;
   setTree: (tree: WorkspaceNode) => void;
   setSelectedPath: (path: string) => void;
@@ -58,6 +99,12 @@ type AppState = {
   setActiveTerminal: (id: string | null) => void;
   setPendingChanges: (changes: PendingAgentChange[]) => void;
   clearPendingChanges: () => void;
+  setProjectInspection: (inspection: ProjectInspection | null) => void;
+  patchSessionMemory: (patch: Partial<SessionMemory>) => void;
+  resetSessionMemory: () => void;
+  replaceTimeline: (entries: TimelineEntry[]) => void;
+  appendTimeline: (entry: TimelineEntry) => void;
+  clearTimeline: () => void;
   toggleExplorer: () => void;
   toggleTerminal: () => void;
   toggleCommandPalette: (open?: boolean) => void;
@@ -78,7 +125,23 @@ export const useAppStore = create<AppState>((set, get) => ({
   settings: defaultLlmConfig(),
   audit: [],
   pendingChanges: [],
-  setWorkspace: (root, tree) => set({ workspaceRoot: root, tree, selectedPath: root }),
+  projectInspection: null,
+  sessionMemory: defaultSessionMemory(),
+  timeline: [],
+  setWorkspace: (root, tree) =>
+    set((state) => {
+      const changed = state.workspaceRoot !== root;
+      return {
+        workspaceRoot: root,
+        tree,
+        selectedPath: root,
+        projectInspection: changed ? null : state.projectInspection,
+        sessionMemory: changed
+          ? { ...defaultSessionMemory(), terminalSessionIds: state.sessionMemory.terminalSessionIds }
+          : state.sessionMemory,
+        timeline: changed ? [] : state.timeline
+      };
+    }),
   setTree: (tree) => set({ tree }),
   setSelectedPath: (path) => set({ selectedPath: path }),
   setRightPanelTab: (rightPanelTab) => set({ rightPanelTab }),
@@ -124,6 +187,30 @@ export const useAppStore = create<AppState>((set, get) => ({
   setActiveTerminal: (activeTerminalId) => set({ activeTerminalId }),
   setPendingChanges: (pendingChanges) => set({ pendingChanges }),
   clearPendingChanges: () => set({ pendingChanges: [] }),
+  setProjectInspection: (projectInspection) => set({ projectInspection }),
+  patchSessionMemory: (patch) =>
+    set((state) => ({
+      sessionMemory: {
+        ...state.sessionMemory,
+        ...patch,
+        detectedScripts: patch.detectedScripts ? Array.from(new Set(patch.detectedScripts)).slice(0, 12) : state.sessionMemory.detectedScripts,
+        terminalSessionIds: patch.terminalSessionIds
+          ? Array.from(new Set(patch.terminalSessionIds)).slice(0, 12)
+          : state.sessionMemory.terminalSessionIds,
+        knownBlockers: patch.knownBlockers ? Array.from(new Set(patch.knownBlockers)).slice(0, 12) : state.sessionMemory.knownBlockers,
+        filesTouched: patch.filesTouched ? Array.from(new Set(patch.filesTouched)).slice(0, 40) : state.sessionMemory.filesTouched
+      }
+    })),
+  resetSessionMemory: () =>
+    set((state) => ({
+      sessionMemory: { ...defaultSessionMemory(), terminalSessionIds: state.sessionMemory.terminalSessionIds }
+    })),
+  replaceTimeline: (entries) => set({ timeline: entries.slice(-300) }),
+  appendTimeline: (entry) =>
+    set((state) => ({
+      timeline: [...state.timeline.slice(-299), entry]
+    })),
+  clearTimeline: () => set({ timeline: [] }),
   toggleExplorer: () => set((state) => ({ explorerVisible: !state.explorerVisible })),
   toggleTerminal: () => set((state) => ({ terminalVisible: !state.terminalVisible })),
   toggleCommandPalette: (open) =>

@@ -139,8 +139,8 @@ export function ExplorerPanel({ refreshTree, openFile }: ExplorerPanelProps) {
   };
 
   return (
-    <div className="flex h-full flex-col overflow-hidden rounded-2xl border border-white/8 bg-[linear-gradient(180deg,rgba(15,21,30,0.96),rgba(9,13,20,0.98))] shadow-[0_12px_36px_rgba(0,0,0,0.2)]">
-      <div className="border-b border-white/8 px-3 py-2">
+    <div className="flex h-full flex-col border-r border-border bg-panel/80">
+      <div className="border-b border-border px-2 py-1.5">
         <div className="mb-1 flex items-center justify-between">
           <div>
             <div className="text-[11px] uppercase tracking-[0.18em] text-muted">Explorer</div>
@@ -156,7 +156,7 @@ export function ExplorerPanel({ refreshTree, openFile }: ExplorerPanelProps) {
           <Button onClick={() => void refreshTree()}>↻</Button>
         </div>
       </div>
-      <div className="border-b border-white/8 px-3 py-2 text-[11px] text-muted">
+      <div className="border-b border-border px-2 py-1.5 text-[11px] text-muted">
         <div className="truncate">{workspaceRoot || "No folder"}</div>
       </div>
       <div className="lumen-scroll flex-1 overflow-auto py-1">

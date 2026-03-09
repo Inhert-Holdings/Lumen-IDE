@@ -5,11 +5,18 @@ export type LlmConfig = {
   baseUrl: string;
   model: string;
   apiKey: string;
+  helperEnabled: boolean;
+  helperUsesMainConnection: boolean;
+  helperProvider: Provider;
+  helperBaseUrl: string;
+  helperModel: string;
+  helperApiKey: string;
   onlineMode: boolean;
   compactMode: boolean;
   autoManageLocalRuntime: boolean;
   autoStopMinutes: number;
   recentModels: string[];
+  helperRecentModels: string[];
 };
 
 export type ChatMessage = {
@@ -24,7 +31,18 @@ export type StreamCallbacks = {
 
 export const LM_STUDIO_PRESET: Omit<
   LlmConfig,
-  "onlineMode" | "compactMode" | "recentModels" | "autoManageLocalRuntime" | "autoStopMinutes"
+  | "helperEnabled"
+  | "helperUsesMainConnection"
+  | "helperProvider"
+  | "helperBaseUrl"
+  | "helperModel"
+  | "helperApiKey"
+  | "onlineMode"
+  | "compactMode"
+  | "recentModels"
+  | "helperRecentModels"
+  | "autoManageLocalRuntime"
+  | "autoStopMinutes"
 > = {
   provider: "lmstudio",
   baseUrl: "http://localhost:1234/v1",
@@ -34,7 +52,18 @@ export const LM_STUDIO_PRESET: Omit<
 
 export const OLLAMA_PRESET: Omit<
   LlmConfig,
-  "onlineMode" | "compactMode" | "recentModels" | "autoManageLocalRuntime" | "autoStopMinutes"
+  | "helperEnabled"
+  | "helperUsesMainConnection"
+  | "helperProvider"
+  | "helperBaseUrl"
+  | "helperModel"
+  | "helperApiKey"
+  | "onlineMode"
+  | "compactMode"
+  | "recentModels"
+  | "helperRecentModels"
+  | "autoManageLocalRuntime"
+  | "autoStopMinutes"
 > = {
   provider: "ollama",
   baseUrl: "http://localhost:11434/v1",
@@ -45,11 +74,18 @@ export const OLLAMA_PRESET: Omit<
 export function defaultLlmConfig(): LlmConfig {
   return {
     ...OLLAMA_PRESET,
+    helperEnabled: true,
+    helperUsesMainConnection: true,
+    helperProvider: OLLAMA_PRESET.provider,
+    helperBaseUrl: OLLAMA_PRESET.baseUrl,
+    helperModel: "qwen2.5-coder:1.5b",
+    helperApiKey: "",
     onlineMode: false,
     compactMode: true,
     autoManageLocalRuntime: true,
     autoStopMinutes: 10,
-    recentModels: [LM_STUDIO_PRESET.model, OLLAMA_PRESET.model]
+    recentModels: [LM_STUDIO_PRESET.model, OLLAMA_PRESET.model],
+    helperRecentModels: ["Qwen2.5-Coder-1.5B-Instruct", "qwen2.5-coder:1.5b", OLLAMA_PRESET.model]
   };
 }
 

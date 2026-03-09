@@ -11,7 +11,8 @@ contextBridge.exposeInMainWorld("lumen", {
     mkdir: (payload) => ipcRenderer.invoke("files:mkdir", payload),
     rename: (payload) => ipcRenderer.invoke("files:rename", payload),
     delete: (payload) => ipcRenderer.invoke("files:delete", payload),
-    search: (payload) => ipcRenderer.invoke("files:search", payload)
+    search: (payload) => ipcRenderer.invoke("files:search", payload),
+    inspect: (payload) => ipcRenderer.invoke("workspace:inspect", payload)
   },
   terminal: {
     create: (payload) => ipcRenderer.invoke("terminal:create", payload),
@@ -75,7 +76,14 @@ contextBridge.exposeInMainWorld("lumen", {
   preview: {
     status: () => ipcRenderer.invoke("preview:status"),
     start: (payload) => ipcRenderer.invoke("preview:start", payload),
-    stop: () => ipcRenderer.invoke("preview:stop")
+    startProject: (payload) => ipcRenderer.invoke("preview:startProject", payload),
+    stop: () => ipcRenderer.invoke("preview:stop"),
+    browserConnect: (payload) => ipcRenderer.invoke("preview:browserConnect", payload),
+    browserSnapshot: () => ipcRenderer.invoke("preview:browserSnapshot"),
+    browserClick: (payload) => ipcRenderer.invoke("preview:browserClick", payload),
+    browserType: (payload) => ipcRenderer.invoke("preview:browserType", payload),
+    browserPress: (payload) => ipcRenderer.invoke("preview:browserPress", payload),
+    browserClose: () => ipcRenderer.invoke("preview:browserClose")
   },
   audit: {
     list: () => ipcRenderer.invoke("audit:list"),

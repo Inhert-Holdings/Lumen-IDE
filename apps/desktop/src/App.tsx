@@ -9,6 +9,7 @@ import { ExplorerPanel } from "@/panels/ExplorerPanel";
 import { RightPanel } from "@/panels/RightPanel";
 import { TerminalPanel } from "@/panels/TerminalPanel";
 import { basename } from "@/lib/utils";
+import { timelineFromAudit, timelineFromAuditList } from "@/lib/timeline";
 import { useAppStore } from "@/state/useAppStore";
 
 function makeId() {
@@ -19,6 +20,7 @@ export default function App() {
   const workspaceRoot = useAppStore((state) => state.workspaceRoot);
   const activeTabId = useAppStore((state) => state.activeTabId);
   const tabs = useAppStore((state) => state.tabs);
+  const terminalTabs = useAppStore((state) => state.terminalTabs);
   const settings = useAppStore((state) => state.settings);
   const explorerVisible = useAppStore((state) => state.explorerVisible);
   const terminalVisible = useAppStore((state) => state.terminalVisible);
@@ -28,6 +30,10 @@ export default function App() {
   const setSettings = useAppStore((state) => state.setSettings);
   const replaceAudit = useAppStore((state) => state.replaceAudit);
   const appendAudit = useAppStore((state) => state.appendAudit);
+  const setProjectInspection = useAppStore((state) => state.setProjectInspection);
+  const patchSessionMemory = useAppStore((state) => state.patchSessionMemory);
+  const replaceTimeline = useAppStore((state) => state.replaceTimeline);
+  const appendTimeline = useAppStore((state) => state.appendTimeline);
   const addTab = useAppStore((state) => state.addTab);
   const updateTab = useAppStore((state) => state.updateTab);
   const toggleExplorer = useAppStore((state) => state.toggleExplorer);
@@ -38,6 +44,17 @@ export default function App() {
 
   const activeTab = tabs.find((tab) => tab.id === activeTabId) || null;
   const workspaceName = workspaceRoot ? basename(workspaceRoot) : "No Workspace";
+
+  const ingestAuditEntry = useCallback(
+    (entry: Parameters<typeof appendAudit>[0]) => {
+      appendAudit(entry);
+      const timelineEntry = timelineFromAudit(entry);
+      if (timelineEntry) {
+        appendTimeline(timelineEntry);
+      }
+    },
+    [appendAudit, appendTimeline]
+  );
 
   const refreshTree = useCallback(async () => {
     const [rootResult, treeResult] = await Promise.all([window.lumen.workspace.getRoot(), window.lumen.workspace.list()]);
@@ -90,20 +107,50 @@ export default function App() {
     );
   }, [setTerminalTabs]);
 
+  const hydrateWorkspaceContext = useCallback(async () => {
+    if (!workspaceRoot) return;
+
+    const [inspection, gitState, previewState, terminals] = await Promise.all([
+      window.lumen.workspace.inspect(),
+      window.lumen.git.status().catch(() => ({ isRepo: false, branch: "", files: [] })),
+      window.lumen.preview.status().catch(() => null),
+      window.lumen.terminal.list().catch(() => ({ terminals: [] }))
+    ]);
+
+    setProjectInspection(inspection);
+    patchSessionMemory({
+      projectType: inspection.framework,
+      detectedScripts: inspection.scripts.map((script) => script.name),
+      currentBranch: gitState.branch || "",
+      activePreviewUrl: previewState?.url || "",
+      previewMode: previewState?.mode || "idle",
+      terminalSessionIds: terminals.terminals.map((terminal) => terminal.id)
+    });
+  }, [patchSessionMemory, setProjectInspection, workspaceRoot]);
+
   useEffect(() => {
     const bootstrap = async () => {
       const [savedSettings, auditEntries] = await Promise.all([window.lumen.settings.load(), window.lumen.audit.list()]);
       setSettings(savedSettings);
-      replaceAudit(auditEntries.entries);
       await refreshTree();
       await ensureTerminal();
+      replaceAudit(auditEntries.entries);
+      replaceTimeline(timelineFromAuditList(auditEntries.entries));
     };
 
     void bootstrap();
 
-    const offAudit = window.lumen.audit.onEntry((entry) => appendAudit(entry));
+    const offAudit = window.lumen.audit.onEntry((entry) => ingestAuditEntry(entry));
     return () => offAudit();
-  }, [appendAudit, ensureTerminal, refreshTree, replaceAudit, setSettings]);
+  }, [ensureTerminal, ingestAuditEntry, refreshTree, replaceAudit, replaceTimeline, setSettings]);
+
+  useEffect(() => {
+    void hydrateWorkspaceContext();
+  }, [hydrateWorkspaceContext]);
+
+  useEffect(() => {
+    patchSessionMemory({ terminalSessionIds: terminalTabs.map((terminal) => terminal.id) });
+  }, [patchSessionMemory, terminalTabs]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -148,24 +195,23 @@ export default function App() {
 
   return (
     <div className={`app-shell ${settings.compactMode ? "compact" : "normal"}`}>
-      <div className="flex h-12 items-center justify-between border-b border-white/5 bg-black/20 px-3">
-        <div className="flex min-w-0 items-center gap-3">
-          <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-white/10 bg-white/5 shadow-[0_0_0_1px_rgba(255,255,255,0.02)]">
+      <div className="flex h-10 items-center justify-between border-b border-border bg-[#0d131d]/96 px-2.5">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <div className="flex h-7 w-7 items-center justify-center rounded-md bg-white/[0.04]">
             <img src={logo} alt="Lumen IDE logo" className="h-5 w-5 object-contain" />
           </div>
           <div className="min-w-0">
-            <div className="text-[12px] font-semibold tracking-[0.18em] text-accent">LUMEN IDE</div>
-            <div className="truncate text-[11px] text-muted">{workspaceName}</div>
+            <div className="text-[11px] font-semibold tracking-[0.14em] text-accent">LUMEN IDE</div>
           </div>
-          <div className="hidden items-center gap-2 md:flex">
+          <div className="hidden items-center gap-1.5 md:flex">
             <Button onClick={() => void openFolder()}>Open Folder</Button>
             <Button onClick={() => void saveActiveTab()} disabled={!activeTab || !activeTab.dirty}>
               Save
             </Button>
           </div>
         </div>
-        <div className="flex items-center gap-2 text-[11px]">
-          <span className="shell-pill hidden max-w-[260px] truncate lg:inline-flex">{workspaceRoot || "No workspace selected"}</span>
+        <div className="flex items-center gap-1.5 text-[11px]">
+          <span className="shell-pill hidden max-w-[260px] truncate lg:inline-flex">{workspaceName}</span>
           <span className={`shell-pill ${settings.onlineMode ? "text-warn" : "text-good"}`}>
             {settings.onlineMode ? "Online On" : "Offline First"}
           </span>
@@ -174,7 +220,7 @@ export default function App() {
         </div>
       </div>
 
-      <div className="h-[calc(100%-76px)] px-2 py-2">
+      <div className="h-[calc(100%-64px)]">
         <PanelGroup direction="vertical">
           <Panel defaultSize={terminalVisible ? 72 : 100} minSize={45}>
             <PanelGroup direction="horizontal">
@@ -183,7 +229,7 @@ export default function App() {
                   <Panel defaultSize={18} minSize={12}>
                     <ExplorerPanel refreshTree={refreshTree} openFile={openFile} />
                   </Panel>
-                  <PanelResizeHandle className="mx-1 w-1 rounded-full bg-white/8 transition hover:bg-accent/40" />
+                  <PanelResizeHandle className="w-1 bg-border/70 transition hover:bg-accent/40" />
                 </>
               )}
 
@@ -191,7 +237,7 @@ export default function App() {
                 <EditorPanel saveActiveTab={saveActiveTab} />
               </Panel>
 
-              <PanelResizeHandle className="mx-1 w-1 rounded-full bg-white/8 transition hover:bg-accent/40" />
+              <PanelResizeHandle className="w-1 bg-border/70 transition hover:bg-accent/40" />
 
               <Panel defaultSize={25} minSize={20}>
                 <RightPanel refreshTree={refreshTree} openFile={openFile} />
@@ -201,7 +247,7 @@ export default function App() {
 
           {terminalVisible && (
             <>
-              <PanelResizeHandle className="my-1 h-1 rounded-full bg-white/8 transition hover:bg-accent/40" />
+              <PanelResizeHandle className="h-1 bg-border/70 transition hover:bg-accent/40" />
               <Panel defaultSize={28} minSize={12}>
                 <TerminalPanel />
               </Panel>
@@ -210,7 +256,7 @@ export default function App() {
         </PanelGroup>
       </div>
 
-      <div className="flex h-7 items-center justify-between border-t border-white/5 bg-black/25 px-3 text-[11px] text-muted">
+      <div className="flex h-6 items-center justify-between border-t border-border bg-[#0a0f17] px-2.5 text-[11px] text-muted">
         <div className="flex min-w-0 items-center gap-3">
           <span className="truncate">{activeTab ? activeTab.path : "No file open"}</span>
           <span>{tabs.length} tab{tabs.length === 1 ? "" : "s"}</span>

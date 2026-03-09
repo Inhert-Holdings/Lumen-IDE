@@ -125,12 +125,9 @@ export function TerminalPanel() {
   }, [activeTerminalId, terminalTabs, setActiveTerminal]);
 
   return (
-    <div
-      ref={rootRef}
-      className="flex h-full flex-col overflow-hidden rounded-2xl border border-white/8 bg-[linear-gradient(180deg,rgba(10,16,24,0.98),rgba(7,10,16,1))] shadow-[0_14px_40px_rgba(0,0,0,0.24)]"
-    >
-      <div className="border-b border-white/8 px-3 py-2">
-        <div className="mb-2 flex items-center justify-between">
+    <div ref={rootRef} className="flex h-full flex-col border-t border-border bg-[#0a1018]">
+      <div className="border-b border-border px-2 py-1.5">
+        <div className="mb-1.5 flex items-center justify-between">
           <div>
             <div className="text-[11px] uppercase tracking-[0.18em] text-muted">Terminal</div>
             <div className="text-[12px] text-text">{activeTerminalId || "No active session"}</div>
@@ -153,10 +150,10 @@ export function TerminalPanel() {
           {terminalTabs.map((tab) => (
             <button
               key={tab.id}
-              className={`flex h-7 items-center gap-2 rounded-lg border px-2 text-[11px] transition ${
+              className={`flex h-7 items-center gap-2 rounded border px-2 text-[11px] transition ${
                 tab.id === activeTerminalId
                   ? "border-accent/40 bg-accent/10 text-accent"
-                  : "border-white/8 bg-white/5 text-muted hover:text-text"
+                  : "border-transparent bg-black/20 text-muted hover:text-text"
               }`}
               onClick={() => setActiveTerminal(tab.id)}
             >

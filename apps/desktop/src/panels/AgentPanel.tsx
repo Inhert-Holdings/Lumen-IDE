@@ -13,6 +13,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Modal } from "@/components/ui/modal";
 import { Textarea } from "@/components/ui/textarea";
+import { createTimelineEntry, timelineFromAudit } from "@/lib/timeline";
 import { useAppStore } from "@/state/useAppStore";
 
 type AgentPanelProps = {
@@ -90,6 +91,10 @@ function isBuildIntent(goal: string) {
     /\b(build|create|make|generate|scaffold|develop)\b/i.test(goal) &&
     /\b(app|application|website|site|landing|dashboard|frontend|ui|web)\b/i.test(goal)
   );
+}
+
+function isPreviewIntent(goal: string) {
+  return /\b(preview|run|start|launch|open|test)\b/i.test(goal) && /\b(app|project|preview|site|website|ui)\b/i.test(goal);
 }
 
 function hasBuildOutputActions(actions: AgentAction[]) {
@@ -322,10 +327,18 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
   const settings = useAppStore((state) => state.settings);
   const tabs = useAppStore((state) => state.tabs);
   const activeTabId = useAppStore((state) => state.activeTabId);
+  const terminalTabs = useAppStore((state) => state.terminalTabs);
+  const terminalVisible = useAppStore((state) => state.terminalVisible);
+  const addTerminalTab = useAppStore((state) => state.addTerminalTab);
+  const setActiveTerminal = useAppStore((state) => state.setActiveTerminal);
+  const toggleTerminal = useAppStore((state) => state.toggleTerminal);
+  const setRightPanelTab = useAppStore((state) => state.setRightPanelTab);
   const appendAudit = useAppStore((state) => state.appendAudit);
+  const appendTimeline = useAppStore((state) => state.appendTimeline);
   const pendingChanges = useAppStore((state) => state.pendingChanges);
   const setPendingChanges = useAppStore((state) => state.setPendingChanges);
   const clearPendingChanges = useAppStore((state) => state.clearPendingChanges);
+  const patchSessionMemory = useAppStore((state) => state.patchSessionMemory);
 
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<ChatLine[]>([]);
@@ -347,9 +360,68 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
   }, [settings.model]);
 
   const activeTabPath = useMemo(() => tabs.find((tab) => tab.id === activeTabId)?.path || "", [tabs, activeTabId]);
+  const helperConnection = useMemo(
+    () =>
+      settings.helperEnabled
+        ? {
+            baseUrl: (settings.helperUsesMainConnection ? settings.baseUrl : settings.helperBaseUrl).trim(),
+            model: settings.helperModel.trim(),
+            apiKey: settings.helperUsesMainConnection ? settings.apiKey : settings.helperApiKey
+          }
+        : null,
+    [
+      settings.apiKey,
+      settings.baseUrl,
+      settings.helperApiKey,
+      settings.helperBaseUrl,
+      settings.helperEnabled,
+      settings.helperModel,
+      settings.helperUsesMainConnection
+    ]
+  );
 
   const pushMessage = (role: ChatLine["role"], text: string, meta?: ChatLine["meta"]) => {
     setMessages((prev) => [...prev, { id: makeId(), role, text, meta }]);
+  };
+
+  const recordAudit = (entry: Parameters<typeof appendAudit>[0]) => {
+    appendAudit(entry);
+    const timelineEntry = timelineFromAudit(entry);
+    if (timelineEntry) {
+      appendTimeline(timelineEntry);
+    }
+  };
+
+  const shouldMirrorLoopAudit = (action: string) =>
+    ![
+      "agent.run_cmd",
+      "agent.preview_start",
+      "agent.preview_status",
+      "agent.preview_snapshot",
+      "agent.preview_click",
+      "agent.preview_type",
+      "agent.preview_press",
+      "agent.git_status",
+      "agent.git_diff",
+      "agent.git_stage",
+      "agent.git_unstage",
+      "agent.git_commit",
+      "agent.git_push"
+    ].includes(action);
+
+  const ensureNamedTerminal = async (title: string) => {
+    const existing = terminalTabs.find((tab) => tab.title === title);
+    if (existing) {
+      setActiveTerminal(existing.id);
+      if (!terminalVisible) toggleTerminal();
+      return existing.id;
+    }
+
+    const created = await window.lumen.terminal.create({ cols: 120, rows: 30 });
+    addTerminalTab({ id: created.id, title });
+    setActiveTerminal(created.id);
+    if (!terminalVisible) toggleTerminal();
+    return created.id;
   };
 
   const requestApproval = async (action: AgentAction, requirement: PermissionRequirement) => {
@@ -362,10 +434,19 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
 
   const streamToText = async (
     modelMessages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
-    options?: { includeReasoning?: boolean; statusLabel?: string }
+    options?: { includeReasoning?: boolean; statusLabel?: string; modelRole?: "main" | "helper" }
   ) => {
     const requestId = makeId();
-    const chosenModel = chatModel.trim() || settings.model;
+    const modelRole = options?.modelRole || "main";
+    const modelConfig =
+      modelRole === "helper" && helperConnection?.baseUrl && helperConnection?.model
+        ? helperConnection
+        : {
+            baseUrl: settings.baseUrl,
+            model: chatModel.trim() || settings.model,
+            apiKey: settings.apiKey
+          };
+    const chosenModel = modelConfig.model;
     const includeReasoning = options?.includeReasoning !== false;
     const enhancedMessages = includeReasoning
       ? [{ role: "system" as const, content: `Reasoning mode: ${reasoningInstruction(reasoningLevel)}` }, ...modelMessages]
@@ -373,7 +454,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
 
     return await new Promise<string>((resolve, reject) => {
       let full = "";
-      setStreamStatus(options?.statusLabel || `Contacting model: ${chosenModel}`);
+      setStreamStatus(options?.statusLabel || `Contacting ${modelRole === "helper" ? "helper" : "main"} model: ${chosenModel}`);
 
       const offChunk = window.lumen.llm.onChunk(({ requestId: chunkId, delta }) => {
         if (chunkId !== requestId) return;
@@ -406,9 +487,9 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
         .startStream({
           requestId,
           config: {
-            baseUrl: settings.baseUrl,
+            baseUrl: modelConfig.baseUrl,
             model: chosenModel,
-            apiKey: settings.apiKey,
+            apiKey: modelConfig.apiKey,
             temperature: reasoningTemperature(reasoningLevel)
           },
           messages: enhancedMessages
@@ -471,6 +552,13 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
 
     if (isBuildIntent(goal)) {
       return defaultScaffoldActions(goal);
+    }
+
+    if (isPreviewIntent(goal)) {
+      return [
+        { type: "preview_start", path: ".", reason: "Run the current project preview inside the workspace" },
+        { type: "preview_snapshot", reason: "Inspect the running preview" }
+      ];
     }
 
     if (isReadIntent(goal) && targetPath) {
@@ -608,8 +696,11 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
       reasoningInstruction(reasoningLevel),
       `Prefer no more than ${maxPlannerActions(reasoningLevel)} actions unless strictly needed.`,
       "Allowed action types:",
-      "list_dir, read_file, search_files, write_file, delete_file, run_cmd, git_status, git_diff, git_stage, git_unstage, git_commit, git_push",
+      "list_dir, read_file, search_files, write_file, delete_file, run_cmd, preview_start, preview_status, preview_snapshot, preview_click, preview_type, preview_press, git_status, git_diff, git_stage, git_unstage, git_commit, git_push",
       "For write_file include path and full desired content.",
+      "Use preview_start to run the current project or a static workspace folder in Lumen preview.",
+      "Use preview_snapshot after preview_start to inspect the page text/title.",
+      "Use preview_click and preview_type with CSS selectors.",
       "Do not use remote actions."
     ].join("\n");
 
@@ -617,7 +708,10 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
       const text = await streamToText([
         { role: "system", content: systemPrompt },
         { role: "user", content: goal }
-      ], { statusLabel: "Planning actions..." });
+      ], {
+        statusLabel: helperConnection?.model ? `Planning with helper model: ${helperConnection.model}` : "Planning actions...",
+        modelRole: "helper"
+      });
       const actions = extractActionsFromText(text).slice(0, maxPlannerActions(reasoningLevel));
       if (actions.length === 0) {
         return heuristicActions(goal);
@@ -691,8 +785,83 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
         };
       }
       case "run_cmd": {
-        const result = await window.lumen.agent.runCmd({ command: action.command || "" });
+        const terminalId = await ensureNamedTerminal("Agent");
+        const result = await window.lumen.agent.runCmd({ command: action.command || "", terminalId });
+        if (result.code !== 0) {
+          patchSessionMemory({
+            lastFailedCommand: action.command || "",
+            knownBlockers: [result.stderr || result.stdout || "Command failed"]
+          });
+        }
         return { ok: result.code === 0, output: `${result.stdout}\n${result.stderr}`.trim() };
+      }
+      case "preview_start": {
+        setRightPanelTab("preview");
+        const terminalId = await ensureNamedTerminal("Preview");
+        try {
+          const result = await window.lumen.preview.startProject({
+            path: action.path || ".",
+            command: action.command,
+            url: action.url,
+            port: action.port,
+            terminalId
+          });
+          patchSessionMemory({
+            activePreviewUrl: result.url,
+            previewMode: result.mode
+          });
+          return { ok: true, output: result };
+        } catch {
+          const result = await window.lumen.preview.start({
+            path: action.path || ".",
+            entry: action.entry || "index.html",
+            port: action.port
+          });
+          patchSessionMemory({
+            activePreviewUrl: result.url,
+            previewMode: result.mode
+          });
+          return { ok: true, output: result };
+        }
+      }
+      case "preview_status": {
+        const result = await window.lumen.preview.status();
+        return { ok: true, output: result };
+      }
+      case "preview_snapshot": {
+        const status = await window.lumen.preview.status();
+        const result = status.browser.connected
+          ? await window.lumen.preview.browserSnapshot()
+          : (await window.lumen.preview.browserConnect({ url: action.url || status.url })).snapshot;
+        return { ok: true, output: result };
+      }
+      case "preview_click": {
+        const status = await window.lumen.preview.status();
+        if (!status.browser.connected) {
+          await window.lumen.preview.browserConnect({ url: action.url || status.url });
+        }
+        const result = await window.lumen.preview.browserClick({ selector: action.selector || "", url: action.url });
+        return { ok: true, output: result };
+      }
+      case "preview_type": {
+        const status = await window.lumen.preview.status();
+        if (!status.browser.connected) {
+          await window.lumen.preview.browserConnect({ url: action.url || status.url });
+        }
+        const result = await window.lumen.preview.browserType({
+          selector: action.selector || "",
+          text: action.text || "",
+          url: action.url
+        });
+        return { ok: true, output: result };
+      }
+      case "preview_press": {
+        const status = await window.lumen.preview.status();
+        if (!status.browser.connected) {
+          await window.lumen.preview.browserConnect({ url: action.url || status.url });
+        }
+        const result = await window.lumen.preview.browserPress({ key: action.key || "Enter", url: action.url });
+        return { ok: true, output: result };
       }
       case "git_status": {
         const result = await window.lumen.git.status();
@@ -731,6 +900,22 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
     setError("");
     pushMessage("user", goal);
     setPrompt("");
+    patchSessionMemory({
+      currentGoal: goal,
+      verificationStatus: "idle",
+      knownBlockers: [],
+      lastFailedCommand: "",
+      filesTouched: []
+    });
+    appendTimeline(
+      createTimelineEntry({
+        phase: "understand",
+        status: "running",
+        title: "Goal received",
+        detail: goal,
+        source: "agent"
+      })
+    );
 
     try {
       if (shouldUseDirectEditPath(goal)) {
@@ -758,7 +943,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
             "APPLY: only after explicit approval"
           ]);
           setPendingChanges(pendingList);
-          appendAudit({
+          recordAudit({
             id: makeId(),
             timestamp: new Date().toISOString(),
             action: "agent.fast_edit",
@@ -766,6 +951,10 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
               path: fastEdit.pendingChange.path,
               relatedFiles: fastEdit.relatedPaths
             }
+          });
+          patchSessionMemory({
+            filesTouched: [fastEdit.pendingChange.path],
+            verificationStatus: shouldRunVerify(reasoningLevel, goal, pendingList.length) ? "pending" : "skipped"
           });
 
           let verifyResult: { ok: boolean; output?: unknown; error?: string } | null = null;
@@ -783,12 +972,19 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
             }
             if (verifyApproved) {
               verifyResult = await executeAction(verifyAction);
-              appendAudit({
+              recordAudit({
                 id: makeId(),
                 timestamp: new Date().toISOString(),
                 action: "agent.verify",
                 detail: { ok: verifyResult.ok, path: fastEdit.pendingChange.path }
               });
+              patchSessionMemory({
+                verificationStatus: verifyResult.ok ? "passed" : "failed",
+                lastFailedCommand: verifyResult.ok ? "" : verifyAction.command || "",
+                knownBlockers: verifyResult.ok ? [] : [verifyResult.error || "Verification failed"]
+              });
+            } else {
+              patchSessionMemory({ verificationStatus: "skipped" });
             }
           }
 
@@ -815,7 +1011,8 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
         executeTool: executeAction,
         requestApproval,
         log: (entry) => {
-          appendAudit({
+          if (!shouldMirrorLoopAudit(entry.action)) return;
+          recordAudit({
             id: makeId(),
             timestamp: entry.timestamp,
             action: entry.action,
@@ -834,7 +1031,8 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
           executeTool: executeAction,
           requestApproval,
           log: (entry) => {
-            appendAudit({
+            if (!shouldMirrorLoopAudit(entry.action)) return;
+            recordAudit({
               id: makeId(),
               timestamp: entry.timestamp,
               action: entry.action,
@@ -858,16 +1056,28 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
           verifyApproved = await requestApproval(verifyAction, verifyRequirement);
         }
         if (verifyApproved) {
+          patchSessionMemory({ verificationStatus: "pending" });
           verifyResult = await executeAction(verifyAction);
-          appendAudit({
+          recordAudit({
             id: makeId(),
             timestamp: new Date().toISOString(),
             action: "agent.verify",
             detail: { ok: verifyResult.ok }
           });
+          patchSessionMemory({
+            verificationStatus: verifyResult.ok ? "passed" : "failed",
+            lastFailedCommand: verifyResult.ok ? "" : verifyAction.command || "",
+            knownBlockers: verifyResult.ok ? [] : [verifyResult.error || "Verification failed"]
+          });
         } else {
           verifyResult = { ok: false, error: "Verification command denied by user" };
+          patchSessionMemory({
+            verificationStatus: "skipped",
+            knownBlockers: ["Verification command denied by user"]
+          });
         }
+      } else {
+        patchSessionMemory({ verificationStatus: "skipped" });
       }
 
       const fallbackEdit = await proposeDirectEdit(goal).catch((fallbackError) => {
@@ -877,6 +1087,16 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
       const allPendingChanges = fallbackEdit
         ? [...loopResult.pendingChanges, fallbackEdit.pendingChange]
         : loopResult.pendingChanges;
+
+      const failedActions = loopResult.actionResults.filter((item) => !item.result.ok && !item.skipped);
+      const failedCommand = failedActions.find((item) => item.action.type === "run_cmd")?.action.command || "";
+      patchSessionMemory({
+        filesTouched: allPendingChanges.map((change) => change.path),
+        lastFailedCommand: failedCommand,
+        knownBlockers: failedActions.map(
+          (item) => item.result.error || item.action.reason || `${item.action.type} failed`
+        )
+      });
 
       setPlanLines(loopResult.plan);
       setPendingChanges(
@@ -904,6 +1124,19 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
     } catch (nextError) {
       const message = nextError instanceof Error ? nextError.message : "Agent run failed";
       setError(message);
+      patchSessionMemory({
+        verificationStatus: "failed",
+        knownBlockers: [message]
+      });
+      appendTimeline(
+        createTimelineEntry({
+          phase: "recover",
+          status: "failed",
+          title: "Agent run failed",
+          detail: message,
+          source: "agent"
+        })
+      );
       pushMessage("system", message);
     } finally {
       setBusy(false);
@@ -916,6 +1149,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
     if (!pendingChanges.length) return;
     if (!window.confirm(`Apply ${pendingChanges.length} pending change(s)?`)) return;
 
+    const changesToApply = [...pendingChanges];
     for (const change of pendingChanges) {
       if (change.type === "write") {
         await window.lumen.workspace.write({ path: change.path, content: change.nextContent });
@@ -926,9 +1160,22 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
 
     clearPendingChanges();
     await refreshTree();
-    if (pendingChanges.length === 1) {
-      await openFile(pendingChanges[0].path);
+    if (changesToApply.length === 1) {
+      await openFile(changesToApply[0].path);
     }
+    patchSessionMemory({
+      filesTouched: changesToApply.map((change) => change.path),
+      knownBlockers: []
+    });
+    appendTimeline(
+      createTimelineEntry({
+        phase: "apply",
+        status: "done",
+        title: "Patch applied",
+        detail: `${changesToApply.length} file change(s) written to workspace`,
+        source: "agent"
+      })
+    );
     pushMessage("system", "Changes applied.");
   };
 
@@ -941,7 +1188,11 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
   return (
     <div className="flex h-full flex-col">
       <div className="border-b border-border px-3 py-2">
-        <div className="mb-2 text-[11px] uppercase tracking-wide text-muted">AI Agent</div>
+        <div className="mb-1 text-[11px] uppercase tracking-wide text-muted">AI Agent</div>
+        <div className="mb-2 text-[11px] text-muted">
+          Main: {chatModel.trim() || settings.model}
+          {helperConnection?.model ? ` · Helper: ${helperConnection.model}` : ""}
+        </div>
         <div className="grid grid-cols-2 gap-2 text-[11px]">
           <label className="block">
             <div className="mb-1 text-muted">Chat Model</div>
@@ -1044,7 +1295,22 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
             </pre>
             <div className="mt-2 flex gap-2">
               <Button onClick={() => void applyPendingChanges()}>Apply Changes</Button>
-              <Button onClick={() => clearPendingChanges()}>Discard</Button>
+              <Button
+                onClick={() => {
+                  clearPendingChanges();
+                  appendTimeline(
+                    createTimelineEntry({
+                      phase: "propose",
+                      status: "blocked",
+                      title: "Patch discarded",
+                      detail: "Pending proposal was cleared without apply",
+                      source: "agent"
+                    })
+                  );
+                }}
+              >
+                Discard
+              </Button>
             </div>
           </div>
         )}
