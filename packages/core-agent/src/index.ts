@@ -50,6 +50,7 @@ export type PendingChange = {
   path: string;
   nextContent: string;
   previousContent: string;
+  existedBefore: boolean;
   diff: string;
 };
 

@@ -50,6 +50,7 @@ type DirectEditResult = {
     path: string;
     previousContent: string;
     nextContent: string;
+    existedBefore: boolean;
     diff: string;
   };
   summary: string;
@@ -338,6 +339,9 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
   const pendingChanges = useAppStore((state) => state.pendingChanges);
   const setPendingChanges = useAppStore((state) => state.setPendingChanges);
   const clearPendingChanges = useAppStore((state) => state.clearPendingChanges);
+  const lastAppliedChanges = useAppStore((state) => state.lastAppliedChanges);
+  const setLastAppliedChanges = useAppStore((state) => state.setLastAppliedChanges);
+  const clearLastAppliedChanges = useAppStore((state) => state.clearLastAppliedChanges);
   const patchSessionMemory = useAppStore((state) => state.patchSessionMemory);
 
   const [prompt, setPrompt] = useState("");
@@ -351,6 +355,8 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
   const [reasoningLevel, setReasoningLevel] = useState<ReasoningLevel>("medium");
   const [fullAccessMode, setFullAccessMode] = useState(true);
   const [showPlan, setShowPlan] = useState(false);
+  const [selectedChangeIds, setSelectedChangeIds] = useState<string[]>([]);
+  const [activeChangeId, setActiveChangeId] = useState("");
 
   const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
   const resolveApprovalRef = useRef<((approved: boolean) => void) | null>(null);
@@ -358,6 +364,21 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
   useEffect(() => {
     setChatModel((current) => current || settings.model);
   }, [settings.model]);
+
+  useEffect(() => {
+    if (!pendingChanges.length) {
+      setSelectedChangeIds([]);
+      setActiveChangeId("");
+      return;
+    }
+
+    setSelectedChangeIds((current) => {
+      const available = new Set(pendingChanges.map((change) => change.id));
+      const filtered = current.filter((id) => available.has(id));
+      return filtered.length ? filtered : pendingChanges.map((change) => change.id);
+    });
+    setActiveChangeId((current) => (pendingChanges.some((change) => change.id === current) ? current : pendingChanges[0].id));
+  }, [pendingChanges]);
 
   const activeTabPath = useMemo(() => tabs.find((tab) => tab.id === activeTabId)?.path || "", [tabs, activeTabId]);
   const helperConnection = useMemo(
@@ -408,6 +429,12 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
       "agent.git_commit",
       "agent.git_push"
     ].includes(action);
+
+  const toggleChangeSelection = (changeId: string) => {
+    setSelectedChangeIds((current) =>
+      current.includes(changeId) ? current.filter((id) => id !== changeId) : [...current, changeId]
+    );
+  };
 
   const ensureNamedTerminal = async (title: string) => {
     const existing = terminalTabs.find((tab) => tab.title === title);
@@ -619,10 +646,12 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
     if (!targetPath || !isEditIntent(goal)) return null;
 
     let before = "";
+    let existedBefore = true;
     try {
       before = (await window.lumen.workspace.read({ path: targetPath })).content;
     } catch {
       before = "";
+      existedBefore = false;
     }
 
     if (before.length > 180000) {
@@ -681,6 +710,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
         path: targetPath,
         previousContent: before,
         nextContent,
+        existedBefore,
         diff: buildDiff(targetPath, before, nextContent)
       },
       summary: summary || `Prepared edits for ${fileLabel(targetPath)}.`,
@@ -746,10 +776,12 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
       case "write_file": {
         const targetPath = normalizePath(workspaceRoot, action.path);
         let before = "";
+        let existedBefore = true;
         try {
           before = (await window.lumen.workspace.read({ path: targetPath })).content;
         } catch {
           before = "";
+          existedBefore = false;
         }
         const next = action.content || "";
         const diff = buildDiff(targetPath, before, next);
@@ -763,6 +795,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
             path: targetPath,
             previousContent: before,
             nextContent: next,
+            existedBefore,
             diff
           }
         };
@@ -780,6 +813,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
             path: targetPath,
             previousContent: before,
             nextContent: "",
+            existedBefore: true,
             diff
           }
         };
@@ -927,7 +961,9 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
               path: fastEdit.pendingChange.path,
               type: fastEdit.pendingChange.type,
               diff: fastEdit.pendingChange.diff,
-              nextContent: fastEdit.pendingChange.nextContent
+              previousContent: fastEdit.pendingChange.previousContent,
+              nextContent: fastEdit.pendingChange.nextContent,
+              existedBefore: fastEdit.pendingChange.existedBefore
             }
           ];
           const directAction: AgentAction = {
@@ -1105,7 +1141,9 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
           path: change.path,
           type: change.type,
           diff: change.diff,
-          nextContent: change.nextContent
+          previousContent: change.previousContent,
+          nextContent: change.nextContent,
+          existedBefore: change.existedBefore
         }))
       );
 
@@ -1145,12 +1183,25 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
     }
   };
 
-  const applyPendingChanges = async () => {
-    if (!pendingChanges.length) return;
-    if (!window.confirm(`Apply ${pendingChanges.length} pending change(s)?`)) return;
+  const selectedPendingChanges = useMemo(
+    () => pendingChanges.filter((change) => selectedChangeIds.includes(change.id)),
+    [pendingChanges, selectedChangeIds]
+  );
+  const unselectedPendingChanges = useMemo(
+    () => pendingChanges.filter((change) => !selectedChangeIds.includes(change.id)),
+    [pendingChanges, selectedChangeIds]
+  );
+  const activePendingChange = useMemo(
+    () => pendingChanges.find((change) => change.id === activeChangeId) || selectedPendingChanges[0] || pendingChanges[0] || null,
+    [activeChangeId, pendingChanges, selectedPendingChanges]
+  );
 
-    const changesToApply = [...pendingChanges];
-    for (const change of pendingChanges) {
+  const applyPendingChanges = async () => {
+    if (!selectedPendingChanges.length) return;
+    if (!window.confirm(`Apply ${selectedPendingChanges.length} selected change(s)?`)) return;
+
+    const changesToApply = [...selectedPendingChanges];
+    for (const change of changesToApply) {
       if (change.type === "write") {
         await window.lumen.workspace.write({ path: change.path, content: change.nextContent });
       } else {
@@ -1158,9 +1209,10 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
       }
     }
 
-    clearPendingChanges();
+    setPendingChanges(unselectedPendingChanges);
+    setLastAppliedChanges(changesToApply);
     await refreshTree();
-    if (changesToApply.length === 1) {
+    if (changesToApply.length === 1 && changesToApply[0].type === "write") {
       await openFile(changesToApply[0].path);
     }
     patchSessionMemory({
@@ -1172,14 +1224,51 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
         phase: "apply",
         status: "done",
         title: "Patch applied",
-        detail: `${changesToApply.length} file change(s) written to workspace`,
+        detail: `${changesToApply.length} selected file change(s) written to workspace`,
         source: "agent"
       })
     );
-    pushMessage("system", "Changes applied.");
+    pushMessage(
+      "system",
+      `Applied ${changesToApply.length} change(s). ${unselectedPendingChanges.length ? `${unselectedPendingChanges.length} proposal(s) still pending.` : ""}`.trim()
+    );
   };
 
-  const diffPreview = useMemo(() => pendingChanges.map((change) => change.diff).join("\n"), [pendingChanges]);
+  const rollbackLastApply = async () => {
+    if (!lastAppliedChanges.length) return;
+    if (!window.confirm(`Rollback ${lastAppliedChanges.length} applied change(s)?`)) return;
+
+    for (const change of lastAppliedChanges) {
+      if (change.type === "delete") {
+        await window.lumen.workspace.write({ path: change.path, content: change.previousContent });
+        continue;
+      }
+
+      if (change.existedBefore) {
+        await window.lumen.workspace.write({ path: change.path, content: change.previousContent });
+      } else {
+        await window.lumen.workspace.delete({ path: change.path });
+      }
+    }
+
+    await refreshTree();
+    clearLastAppliedChanges();
+    patchSessionMemory({
+      filesTouched: lastAppliedChanges.map((change) => change.path)
+    });
+    appendTimeline(
+      createTimelineEntry({
+        phase: "recover",
+        status: "done",
+        title: "Rollback completed",
+        detail: `${lastAppliedChanges.length} file change(s) reverted`,
+        source: "agent"
+      })
+    );
+    pushMessage("system", "Rolled back the last applied patch.");
+  };
+
+  const diffPreview = useMemo(() => selectedPendingChanges.map((change) => change.diff).join("\n"), [selectedPendingChanges]);
   const modelOptions = useMemo(
     () => Array.from(new Set([chatModel, settings.model, ...(settings.recentModels || [])].filter(Boolean))),
     [chatModel, settings.model, settings.recentModels]
@@ -1289,12 +1378,49 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
 
         {pendingChanges.length > 0 && (
           <div className="mb-2 rounded border border-accent/40 bg-accent/5 p-2 text-[11px]">
-            <div className="mb-2 text-[10px] uppercase text-accent">Proposed Diff Preview</div>
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="text-[10px] uppercase text-accent">Patch Review</div>
+              <div className="text-[10px] text-muted">
+                {selectedPendingChanges.length}/{pendingChanges.length} selected
+              </div>
+            </div>
+            <div className="mb-2 space-y-1 rounded border border-border bg-black/20 p-2">
+              {pendingChanges.map((change) => {
+                const selected = selectedChangeIds.includes(change.id);
+                return (
+                  <label key={change.id} className="flex cursor-pointer items-center justify-between gap-2 rounded border border-transparent px-2 py-1 hover:border-border">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={selected}
+                        onChange={() => toggleChangeSelection(change.id)}
+                      />
+                      <button
+                        type="button"
+                        className={`truncate text-left ${activePendingChange?.id === change.id ? "text-accent" : "text-text"}`}
+                        onClick={() => setActiveChangeId(change.id)}
+                      >
+                        {fileLabel(change.path)}
+                      </button>
+                    </div>
+                    <span className="text-[10px] uppercase text-muted">{change.type}</span>
+                  </label>
+                );
+              })}
+            </div>
             <pre className="lumen-scroll max-h-56 overflow-auto whitespace-pre-wrap break-words rounded border border-border bg-black/30 p-2">
-              {redactSecrets(diffPreview)}
+              {redactSecrets(activePendingChange?.diff || diffPreview)}
             </pre>
             <div className="mt-2 flex gap-2">
-              <Button onClick={() => void applyPendingChanges()}>Apply Changes</Button>
+              <Button onClick={() => void applyPendingChanges()} disabled={!selectedPendingChanges.length}>
+                Apply Selected
+              </Button>
+              <Button
+                onClick={() => setSelectedChangeIds(pendingChanges.map((change) => change.id))}
+                disabled={selectedPendingChanges.length === pendingChanges.length}
+              >
+                Select All
+              </Button>
               <Button
                 onClick={() => {
                   clearPendingChanges();
@@ -1312,6 +1438,16 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
                 Discard
               </Button>
             </div>
+          </div>
+        )}
+
+        {lastAppliedChanges.length > 0 && (
+          <div className="mb-2 rounded border border-border bg-black/20 p-2 text-[11px]">
+            <div className="mb-1 text-[10px] uppercase text-muted">Last Applied Patch</div>
+            <div className="mb-2 text-muted">
+              {lastAppliedChanges.length} file change(s) were applied in the last patch set.
+            </div>
+            <Button onClick={() => void rollbackLastApply()}>Rollback Last Apply</Button>
           </div>
         )}
       </div>
@@ -1342,6 +1478,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
               setMessages([]);
               setPlanLines([]);
               clearPendingChanges();
+              clearLastAppliedChanges();
             }}
           >
             Clear

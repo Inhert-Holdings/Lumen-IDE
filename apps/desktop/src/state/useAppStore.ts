@@ -21,7 +21,9 @@ export type PendingAgentChange = {
   type: "write" | "delete";
   path: string;
   diff: string;
+  previousContent: string;
   nextContent: string;
+  existedBefore: boolean;
 };
 
 export type TimelineEntry = {
@@ -79,6 +81,7 @@ type AppState = {
   settings: LlmConfig;
   audit: AuditEntry[];
   pendingChanges: PendingAgentChange[];
+  lastAppliedChanges: PendingAgentChange[];
   projectInspection: ProjectInspection | null;
   sessionMemory: SessionMemory;
   timeline: TimelineEntry[];
@@ -99,6 +102,8 @@ type AppState = {
   setActiveTerminal: (id: string | null) => void;
   setPendingChanges: (changes: PendingAgentChange[]) => void;
   clearPendingChanges: () => void;
+  setLastAppliedChanges: (changes: PendingAgentChange[]) => void;
+  clearLastAppliedChanges: () => void;
   setProjectInspection: (inspection: ProjectInspection | null) => void;
   patchSessionMemory: (patch: Partial<SessionMemory>) => void;
   resetSessionMemory: () => void;
@@ -125,6 +130,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   settings: defaultLlmConfig(),
   audit: [],
   pendingChanges: [],
+  lastAppliedChanges: [],
   projectInspection: null,
   sessionMemory: defaultSessionMemory(),
   timeline: [],
@@ -136,6 +142,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         tree,
         selectedPath: root,
         projectInspection: changed ? null : state.projectInspection,
+        lastAppliedChanges: changed ? [] : state.lastAppliedChanges,
         sessionMemory: changed
           ? { ...defaultSessionMemory(), terminalSessionIds: state.sessionMemory.terminalSessionIds }
           : state.sessionMemory,
@@ -187,6 +194,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   setActiveTerminal: (activeTerminalId) => set({ activeTerminalId }),
   setPendingChanges: (pendingChanges) => set({ pendingChanges }),
   clearPendingChanges: () => set({ pendingChanges: [] }),
+  setLastAppliedChanges: (lastAppliedChanges) => set({ lastAppliedChanges }),
+  clearLastAppliedChanges: () => set({ lastAppliedChanges: [] }),
   setProjectInspection: (projectInspection) => set({ projectInspection }),
   patchSessionMemory: (patch) =>
     set((state) => ({
