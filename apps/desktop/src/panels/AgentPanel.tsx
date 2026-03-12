@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { applyPatch, formatPatch, parsePatch, type ParsedDiff } from "diff";
 
 import {
   buildDiff,
@@ -55,6 +56,14 @@ type DirectEditResult = {
   };
   summary: string;
   relatedPaths: string[];
+};
+
+type HunkMeta = {
+  id: string;
+  header: string;
+  added: number;
+  removed: number;
+  preview: string;
 };
 
 function makeId() {
@@ -264,13 +273,43 @@ function shouldRunVerify(level: ReasoningLevel, goal: string, pendingChanges: nu
   return pendingChanges > 0 || explicitVerify;
 }
 
-function stringifyOutput(value: unknown) {
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
+function parseChangePatch(diffText: string): ParsedDiff | null {
+  const patches = parsePatch(diffText || "");
+  return patches[0] || null;
+}
+
+function buildHunkMeta(diffText: string): HunkMeta[] {
+  const patch = parseChangePatch(diffText);
+  if (!patch?.hunks?.length) return [];
+
+  return patch.hunks.map((hunk, index) => {
+    const added = hunk.lines.filter((line) => line.startsWith("+")).length;
+    const removed = hunk.lines.filter((line) => line.startsWith("-")).length;
+    const preview = hunk.lines
+      .filter((line) => line.startsWith("+") || line.startsWith("-"))
+      .slice(0, 5)
+      .join("\n");
+    return {
+      id: String(index),
+      header: `@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@`,
+      added,
+      removed,
+      preview
+    };
+  });
+}
+
+function buildPatchFromHunks(diffText: string, selectedHunkIds: string[]) {
+  const patch = parseChangePatch(diffText);
+  if (!patch?.hunks?.length) return "";
+
+  const chosen = patch.hunks.filter((_hunk, index) => selectedHunkIds.includes(String(index)));
+  if (!chosen.length) return "";
+
+  return formatPatch({
+    ...patch,
+    hunks: chosen
+  });
 }
 
 function parseRelativeSpecifiers(source: string) {
@@ -339,9 +378,10 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
   const pendingChanges = useAppStore((state) => state.pendingChanges);
   const setPendingChanges = useAppStore((state) => state.setPendingChanges);
   const clearPendingChanges = useAppStore((state) => state.clearPendingChanges);
-  const lastAppliedChanges = useAppStore((state) => state.lastAppliedChanges);
-  const setLastAppliedChanges = useAppStore((state) => state.setLastAppliedChanges);
-  const clearLastAppliedChanges = useAppStore((state) => state.clearLastAppliedChanges);
+  const appliedPatchHistory = useAppStore((state) => state.appliedPatchHistory);
+  const pushAppliedPatchSet = useAppStore((state) => state.pushAppliedPatchSet);
+  const popAppliedPatchSet = useAppStore((state) => state.popAppliedPatchSet);
+  const clearAppliedPatchHistory = useAppStore((state) => state.clearAppliedPatchHistory);
   const patchSessionMemory = useAppStore((state) => state.patchSessionMemory);
 
   const [prompt, setPrompt] = useState("");
@@ -356,6 +396,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
   const [fullAccessMode, setFullAccessMode] = useState(true);
   const [showPlan, setShowPlan] = useState(false);
   const [selectedChangeIds, setSelectedChangeIds] = useState<string[]>([]);
+  const [selectedHunksByChange, setSelectedHunksByChange] = useState<Record<string, string[]>>({});
   const [activeChangeId, setActiveChangeId] = useState("");
 
   const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -368,6 +409,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
   useEffect(() => {
     if (!pendingChanges.length) {
       setSelectedChangeIds([]);
+      setSelectedHunksByChange({});
       setActiveChangeId("");
       return;
     }
@@ -376,6 +418,19 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
       const available = new Set(pendingChanges.map((change) => change.id));
       const filtered = current.filter((id) => available.has(id));
       return filtered.length ? filtered : pendingChanges.map((change) => change.id);
+    });
+    setSelectedHunksByChange((current) => {
+      const next: Record<string, string[]> = {};
+      for (const change of pendingChanges) {
+        const availableHunks = buildHunkMeta(change.diff).map((hunk) => hunk.id);
+        if (!availableHunks.length) {
+          next[change.id] = [];
+          continue;
+        }
+        const existing = (current[change.id] || []).filter((id) => availableHunks.includes(id));
+        next[change.id] = existing.length ? existing : availableHunks;
+      }
+      return next;
     });
     setActiveChangeId((current) => (pendingChanges.some((change) => change.id === current) ? current : pendingChanges[0].id));
   }, [pendingChanges]);
@@ -434,6 +489,21 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
     setSelectedChangeIds((current) =>
       current.includes(changeId) ? current.filter((id) => id !== changeId) : [...current, changeId]
     );
+  };
+
+  const toggleHunkSelection = (changeId: string, hunkId: string) => {
+    setSelectedHunksByChange((current) => {
+      const existing = current[changeId] || [];
+      const next = existing.includes(hunkId) ? existing.filter((id) => id !== hunkId) : [...existing, hunkId];
+      return { ...current, [changeId]: next };
+    });
+  };
+
+  const setAllHunksSelected = (changeId: string, selected: boolean) => {
+    const change = pendingChanges.find((item) => item.id === changeId);
+    if (!change) return;
+    const allHunks = buildHunkMeta(change.diff).map((hunk) => hunk.id);
+    setSelectedHunksByChange((current) => ({ ...current, [changeId]: selected ? allHunks : [] }));
   };
 
   const ensureNamedTerminal = async (title: string) => {
@@ -966,12 +1036,6 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
               existedBefore: fastEdit.pendingChange.existedBefore
             }
           ];
-          const directAction: AgentAction = {
-            type: "write_file",
-            path: fastEdit.pendingChange.path,
-            reason: "Fast direct edit path"
-          };
-
           setPlanLines([
             `FAST EDIT: ${fileLabel(fastEdit.pendingChange.path)}`,
             "CONTEXT: use active file and nearby imports",
@@ -1187,36 +1251,105 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
     () => pendingChanges.filter((change) => selectedChangeIds.includes(change.id)),
     [pendingChanges, selectedChangeIds]
   );
-  const unselectedPendingChanges = useMemo(
-    () => pendingChanges.filter((change) => !selectedChangeIds.includes(change.id)),
-    [pendingChanges, selectedChangeIds]
-  );
   const activePendingChange = useMemo(
     () => pendingChanges.find((change) => change.id === activeChangeId) || selectedPendingChanges[0] || pendingChanges[0] || null,
     [activeChangeId, pendingChanges, selectedPendingChanges]
   );
+  const activePendingHunks = useMemo(
+    () => (activePendingChange ? buildHunkMeta(activePendingChange.diff) : []),
+    [activePendingChange]
+  );
+  const activeSelectedHunkIds = useMemo(() => {
+    if (!activePendingChange) return [];
+    const selected = selectedHunksByChange[activePendingChange.id];
+    if (selected && selected.length) return selected;
+    return activePendingHunks.map((hunk) => hunk.id);
+  }, [activePendingChange, activePendingHunks, selectedHunksByChange]);
+  const selectedChangeCountWithHunks = useMemo(
+    () =>
+      selectedPendingChanges.filter((change) => {
+        const hunks = buildHunkMeta(change.diff);
+        if (!hunks.length) return true;
+        const selected = selectedHunksByChange[change.id] || [];
+        return selected.length > 0;
+      }).length,
+    [selectedPendingChanges, selectedHunksByChange]
+  );
+  const latestAppliedPatchSet = appliedPatchHistory.at(-1) || null;
 
   const applyPendingChanges = async () => {
     if (!selectedPendingChanges.length) return;
-    if (!window.confirm(`Apply ${selectedPendingChanges.length} selected change(s)?`)) return;
+    if (!selectedChangeCountWithHunks) return;
+    if (!window.confirm(`Apply ${selectedChangeCountWithHunks} selected change(s)?`)) return;
 
-    const changesToApply = [...selectedPendingChanges];
-    for (const change of changesToApply) {
-      if (change.type === "write") {
-        await window.lumen.workspace.write({ path: change.path, content: change.nextContent });
-      } else {
-        await window.lumen.workspace.delete({ path: change.path });
+    const nextPending: typeof pendingChanges = [];
+    const appliedChanges: typeof pendingChanges = [];
+
+    for (const change of pendingChanges) {
+      if (!selectedChangeIds.includes(change.id)) {
+        nextPending.push(change);
+        continue;
+      }
+
+      const hunks = buildHunkMeta(change.diff);
+      const selectedHunkIds = hunks.length
+        ? (selectedHunksByChange[change.id] || []).filter((id) => hunks.some((hunk) => hunk.id === id))
+        : [];
+      if (hunks.length && selectedHunkIds.length === 0) {
+        nextPending.push(change);
+        continue;
+      }
+
+      const allHunksSelected = !hunks.length || selectedHunkIds.length === hunks.length;
+      const fullTarget = change.type === "delete" ? "" : change.nextContent;
+      let applyTarget = fullTarget;
+
+      if (!allHunksSelected) {
+        const selectedPatch = buildPatchFromHunks(change.diff, selectedHunkIds);
+        const partialTarget = selectedPatch ? applyPatch(change.previousContent, selectedPatch) : change.previousContent;
+        if (partialTarget === false) {
+          throw new Error(`Could not apply selected hunks for ${fileLabel(change.path)}.`);
+        }
+        applyTarget = partialTarget;
+      }
+
+      if (applyTarget !== change.previousContent) {
+        if (change.type === "delete" && applyTarget === "") {
+          await window.lumen.workspace.delete({ path: change.path });
+        } else {
+          await window.lumen.workspace.write({ path: change.path, content: applyTarget });
+        }
+        appliedChanges.push({
+          ...change,
+          nextContent: applyTarget,
+          diff: buildDiff(change.path, change.previousContent, applyTarget)
+        });
+      }
+
+      if (!allHunksSelected && applyTarget !== fullTarget) {
+        nextPending.push({
+          ...change,
+          previousContent: applyTarget,
+          existedBefore: change.existedBefore || applyTarget.length > 0,
+          diff: buildDiff(change.path, applyTarget, fullTarget)
+        });
       }
     }
 
-    setPendingChanges(unselectedPendingChanges);
-    setLastAppliedChanges(changesToApply);
+    if (!appliedChanges.length) return;
+
+    setPendingChanges(nextPending);
+    pushAppliedPatchSet({
+      id: makeId(),
+      timestamp: new Date().toISOString(),
+      changes: appliedChanges
+    });
     await refreshTree();
-    if (changesToApply.length === 1 && changesToApply[0].type === "write") {
-      await openFile(changesToApply[0].path);
+    if (appliedChanges.length === 1 && appliedChanges[0].type === "write") {
+      await openFile(appliedChanges[0].path);
     }
     patchSessionMemory({
-      filesTouched: changesToApply.map((change) => change.path),
+      filesTouched: appliedChanges.map((change) => change.path),
       knownBlockers: []
     });
     appendTimeline(
@@ -1224,21 +1357,21 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
         phase: "apply",
         status: "done",
         title: "Patch applied",
-        detail: `${changesToApply.length} selected file change(s) written to workspace`,
+        detail: `${appliedChanges.length} selected file change(s) written to workspace`,
         source: "agent"
       })
     );
     pushMessage(
       "system",
-      `Applied ${changesToApply.length} change(s). ${unselectedPendingChanges.length ? `${unselectedPendingChanges.length} proposal(s) still pending.` : ""}`.trim()
+      `Applied ${appliedChanges.length} change(s). ${nextPending.length ? `${nextPending.length} proposal(s) still pending.` : ""}`.trim()
     );
   };
 
   const rollbackLastApply = async () => {
-    if (!lastAppliedChanges.length) return;
-    if (!window.confirm(`Rollback ${lastAppliedChanges.length} applied change(s)?`)) return;
+    if (!latestAppliedPatchSet) return;
+    if (!window.confirm(`Rollback ${latestAppliedPatchSet.changes.length} applied change(s)?`)) return;
 
-    for (const change of lastAppliedChanges) {
+    for (const change of latestAppliedPatchSet.changes) {
       if (change.type === "delete") {
         await window.lumen.workspace.write({ path: change.path, content: change.previousContent });
         continue;
@@ -1252,23 +1385,30 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
     }
 
     await refreshTree();
-    clearLastAppliedChanges();
+    popAppliedPatchSet();
     patchSessionMemory({
-      filesTouched: lastAppliedChanges.map((change) => change.path)
+      filesTouched: latestAppliedPatchSet.changes.map((change) => change.path)
     });
     appendTimeline(
       createTimelineEntry({
         phase: "recover",
         status: "done",
         title: "Rollback completed",
-        detail: `${lastAppliedChanges.length} file change(s) reverted`,
+        detail: `${latestAppliedPatchSet.changes.length} file change(s) reverted`,
         source: "agent"
       })
     );
     pushMessage("system", "Rolled back the last applied patch.");
   };
 
-  const diffPreview = useMemo(() => selectedPendingChanges.map((change) => change.diff).join("\n"), [selectedPendingChanges]);
+  const diffPreview = useMemo(() => {
+    if (activePendingChange) {
+      const selectedHunks = activeSelectedHunkIds;
+      const partial = buildPatchFromHunks(activePendingChange.diff, selectedHunks);
+      return partial || activePendingChange.diff;
+    }
+    return selectedPendingChanges.map((change) => change.diff).join("\n");
+  }, [activePendingChange, activeSelectedHunkIds, selectedPendingChanges]);
   const modelOptions = useMemo(
     () => Array.from(new Set([chatModel, settings.model, ...(settings.recentModels || [])].filter(Boolean))),
     [chatModel, settings.model, settings.recentModels]
@@ -1381,7 +1521,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
             <div className="mb-2 flex items-center justify-between gap-2">
               <div className="text-[10px] uppercase text-accent">Patch Review</div>
               <div className="text-[10px] text-muted">
-                {selectedPendingChanges.length}/{pendingChanges.length} selected
+                {selectedChangeCountWithHunks}/{pendingChanges.length} selected
               </div>
             </div>
             <div className="mb-2 space-y-1 rounded border border-border bg-black/20 p-2">
@@ -1408,11 +1548,49 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
                 );
               })}
             </div>
+            {activePendingChange && activePendingHunks.length > 0 && (
+              <div className="mb-2 rounded border border-border bg-black/25 p-2">
+                <div className="mb-1 flex items-center justify-between">
+                  <div className="text-[10px] uppercase text-muted">Hunks · {fileLabel(activePendingChange.path)}</div>
+                  <div className="flex gap-1">
+                    <Button onClick={() => setAllHunksSelected(activePendingChange.id, true)}>All Hunks</Button>
+                    <Button onClick={() => setAllHunksSelected(activePendingChange.id, false)}>Clear Hunks</Button>
+                  </div>
+                </div>
+                <div className="space-y-1">
+                  {activePendingHunks.map((hunk) => {
+                    const selected = activeSelectedHunkIds.includes(hunk.id);
+                    return (
+                      <label
+                        key={`${activePendingChange.id}-${hunk.id}`}
+                        className="block cursor-pointer rounded border border-transparent px-2 py-1 hover:border-border"
+                      >
+                        <div className="mb-1 flex items-center gap-2">
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            onChange={() => toggleHunkSelection(activePendingChange.id, hunk.id)}
+                          />
+                          <span className="text-[10px] text-muted">{hunk.header}</span>
+                          <span className="text-[10px] text-good">+{hunk.added}</span>
+                          <span className="text-[10px] text-bad">-{hunk.removed}</span>
+                        </div>
+                        {hunk.preview && (
+                          <pre className="lumen-scroll max-h-20 overflow-auto whitespace-pre-wrap break-words rounded border border-border bg-black/30 p-2 text-[10px] text-muted">
+                            {redactSecrets(hunk.preview)}
+                          </pre>
+                        )}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
             <pre className="lumen-scroll max-h-56 overflow-auto whitespace-pre-wrap break-words rounded border border-border bg-black/30 p-2">
-              {redactSecrets(activePendingChange?.diff || diffPreview)}
+              {redactSecrets(diffPreview)}
             </pre>
             <div className="mt-2 flex gap-2">
-              <Button onClick={() => void applyPendingChanges()} disabled={!selectedPendingChanges.length}>
+              <Button onClick={() => void applyPendingChanges()} disabled={!selectedChangeCountWithHunks}>
                 Apply Selected
               </Button>
               <Button
@@ -1441,13 +1619,24 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
           </div>
         )}
 
-        {lastAppliedChanges.length > 0 && (
+        {appliedPatchHistory.length > 0 && (
           <div className="mb-2 rounded border border-border bg-black/20 p-2 text-[11px]">
-            <div className="mb-1 text-[10px] uppercase text-muted">Last Applied Patch</div>
+            <div className="mb-1 text-[10px] uppercase text-muted">Applied Patch History</div>
             <div className="mb-2 text-muted">
-              {lastAppliedChanges.length} file change(s) were applied in the last patch set.
+              {appliedPatchHistory.length} patch set(s) recorded in this session.
             </div>
-            <Button onClick={() => void rollbackLastApply()}>Rollback Last Apply</Button>
+            {latestAppliedPatchSet && (
+              <div className="mb-2 text-muted">
+                Latest patch: {latestAppliedPatchSet.changes.length} file change(s) at{" "}
+                {new Date(latestAppliedPatchSet.timestamp).toLocaleTimeString()}.
+              </div>
+            )}
+            <div className="flex gap-2">
+              <Button onClick={() => void rollbackLastApply()} disabled={!latestAppliedPatchSet}>
+                Rollback Latest
+              </Button>
+              <Button onClick={() => clearAppliedPatchHistory()}>Clear History</Button>
+            </div>
           </div>
         )}
       </div>
@@ -1478,7 +1667,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
               setMessages([]);
               setPlanLines([]);
               clearPendingChanges();
-              clearLastAppliedChanges();
+              clearAppliedPatchHistory();
             }}
           >
             Clear

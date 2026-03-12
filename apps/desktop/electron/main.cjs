@@ -648,8 +648,23 @@ function inferPreviewUrl(scriptName, scriptText, preferredUrl, preferredPort) {
   if (lower.includes("vite")) {
     return "http://127.0.0.1:5173";
   }
+  if (lower.includes("astro")) {
+    return "http://127.0.0.1:4321";
+  }
   if (lower.includes("next")) {
     return "http://127.0.0.1:3000";
+  }
+  if (lower.includes("nuxt")) {
+    return "http://127.0.0.1:3000";
+  }
+  if (lower.includes("svelte-kit") || lower.includes("sveltekit")) {
+    return "http://127.0.0.1:5173";
+  }
+  if (lower.includes("webpack-dev-server") || lower.includes("react-scripts start")) {
+    return "http://127.0.0.1:3000";
+  }
+  if (lower.includes("angular") || lower.includes("ng serve")) {
+    return "http://127.0.0.1:4200";
   }
   return "http://127.0.0.1:3000";
 }
@@ -667,6 +682,15 @@ function detectNodeFramework(packageJson, scripts) {
   if (dependencyNames.has("next") || scriptBlob.includes("next dev")) {
     return { framework: "Next.js", confidence: "high" };
   }
+  if (dependencyNames.has("astro") || scriptBlob.includes("astro dev")) {
+    return { framework: "Astro", confidence: "high" };
+  }
+  if (dependencyNames.has("nuxt") || scriptBlob.includes("nuxt dev")) {
+    return { framework: "Nuxt", confidence: "high" };
+  }
+  if (dependencyNames.has("@sveltejs/kit") || scriptBlob.includes("svelte-kit")) {
+    return { framework: "SvelteKit", confidence: "high" };
+  }
   if (dependencyNames.has("vite") || scriptBlob.includes("vite")) {
     return { framework: "Vite", confidence: "high" };
   }
@@ -680,6 +704,44 @@ function detectNodeFramework(packageJson, scripts) {
     return { framework: "React", confidence: "medium" };
   }
   return { framework: "Node app", confidence: "low" };
+}
+
+function selectNodeRunScript(scripts) {
+  const names = Object.keys(scripts || {});
+  const ranked = [
+    "dev",
+    "start",
+    "preview",
+    "serve",
+    "dev:server",
+    "dev:app",
+    "start:dev",
+    "start:server",
+    "web",
+    "frontend"
+  ];
+
+  for (const candidate of ranked) {
+    if (typeof scripts?.[candidate] === "string") {
+      return candidate;
+    }
+  }
+
+  const regexCandidates = [
+    /^dev[:_-]/i,
+    /^start[:_-]/i,
+    /^serve[:_-]/i,
+    /dev/i,
+    /start/i,
+    /serve/i,
+    /preview/i
+  ];
+  for (const pattern of regexCandidates) {
+    const found = names.find((name) => pattern.test(name) && typeof scripts[name] === "string");
+    if (found) return found;
+  }
+
+  return "";
 }
 
 function findStaticRoot(rootPath) {
@@ -700,7 +762,7 @@ function inspectNodeProject(rootPath, packageJson) {
     .filter(([, command]) => typeof command === "string")
     .map(([name, command]) => ({ name, command: String(command) }));
   const detected = detectNodeFramework(packageJson, scripts);
-  const runScript = ["dev", "start", "preview"].find((candidate) => typeof scripts[candidate] === "string") || "";
+  const runScript = selectNodeRunScript(scripts);
   const buildScript = typeof scripts.build === "string" ? "build" : "";
   const staticTarget = findStaticRoot(rootPath);
 
@@ -762,6 +824,24 @@ function inspectPythonProject(rootPath) {
       staticRoot: "",
       entryFile: "",
       summary: "Flask project detected. Suggested run command: flask --app ... run --debug"
+    };
+  }
+
+  const hasManagePy = fs.existsSync(path.join(rootPath, "manage.py"));
+  if (combined.includes("django") || hasManagePy) {
+    return {
+      rootPath,
+      kind: "python",
+      framework: "Django",
+      confidence: hasManagePy ? "high" : "medium",
+      packageManager: "python",
+      scripts: [],
+      runCommand: "python manage.py runserver",
+      buildCommand: "",
+      devUrl: "http://127.0.0.1:8000",
+      staticRoot: "",
+      entryFile: "",
+      summary: "Django project detected. Suggested run command: python manage.py runserver"
     };
   }
 
@@ -836,12 +916,14 @@ function detectPreviewProject(payload = {}) {
     throw new Error("Run Current Project currently supports package.json-based projects. Use Serve Static Folder otherwise.");
   }
 
+  const scriptsMap = Object.fromEntries(inspection.scripts.map((script) => [script.name, script.command]));
   const preferredScript = String(payload.command || "").trim();
+  const inferredScript = selectNodeRunScript(scriptsMap);
   const selectedScript = preferredScript
     ? inspection.scripts.find((script) => script.name === preferredScript)
-    : inspection.scripts.find((script) => ["dev", "start", "preview"].includes(script.name));
+    : inspection.scripts.find((script) => script.name === inferredScript);
   if (!selectedScript) {
-    throw new Error("No runnable project script found. Expected dev, start, or preview.");
+    throw new Error("No runnable project script found. Add a dev/start script in package.json, then retry.");
   }
 
   return {

@@ -5,6 +5,8 @@
   "scripts": {
     "dev": "pnpm --filter @lumen/desktop dev",
     "build": "pnpm --filter @lumen/desktop build",
+    "clean": "pnpm --filter @lumen/desktop clean",
+    "clean:deep": "pnpm --filter @lumen/desktop clean && pnpm store prune",
     "format": "prettier --check *.json *.md docs/*.md .github/workflows/*.yml **/*.js",
     "format:fix": "prettier --write *.json *.md docs/*.md .github/workflows/*.yml **/*.js"
   },

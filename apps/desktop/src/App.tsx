@@ -26,7 +26,6 @@ export default function App() {
   const terminalVisible = useAppStore((state) => state.terminalVisible);
   const commandPaletteOpen = useAppStore((state) => state.commandPaletteOpen);
   const setWorkspace = useAppStore((state) => state.setWorkspace);
-  const setTree = useAppStore((state) => state.setTree);
   const setSettings = useAppStore((state) => state.setSettings);
   const replaceAudit = useAppStore((state) => state.replaceAudit);
   const appendAudit = useAppStore((state) => state.appendAudit);
@@ -40,7 +39,6 @@ export default function App() {
   const toggleTerminal = useAppStore((state) => state.toggleTerminal);
   const toggleCommandPalette = useAppStore((state) => state.toggleCommandPalette);
   const setTerminalTabs = useAppStore((state) => state.setTerminalTabs);
-  const addTerminalTab = useAppStore((state) => state.addTerminalTab);
 
   const activeTab = tabs.find((tab) => tab.id === activeTabId) || null;
   const workspaceName = workspaceRoot ? basename(workspaceRoot) : "No Workspace";

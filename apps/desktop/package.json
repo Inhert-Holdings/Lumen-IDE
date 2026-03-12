@@ -10,6 +10,7 @@
     "renderer:dev": "vite",
     "electron:dev": "wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron ./electron/main.cjs",
     "renderer:build": "vite build",
+    "clean": "node -e \"const fs=require('node:fs');['dist','release','.vite','node_modules/.vite'].forEach((dir)=>fs.rmSync(dir,{recursive:true,force:true}));\"",
     "build": "pnpm renderer:build && electron-builder",
     "postinstall": "node ./node_modules/electron/install.js",
     "typecheck": "tsc --noEmit",

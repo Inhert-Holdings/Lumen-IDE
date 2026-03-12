@@ -26,6 +26,12 @@ export type PendingAgentChange = {
   existedBefore: boolean;
 };
 
+export type AppliedPatchSet = {
+  id: string;
+  timestamp: string;
+  changes: PendingAgentChange[];
+};
+
 export type TimelineEntry = {
   id: string;
   timestamp: string;
@@ -81,7 +87,7 @@ type AppState = {
   settings: LlmConfig;
   audit: AuditEntry[];
   pendingChanges: PendingAgentChange[];
-  lastAppliedChanges: PendingAgentChange[];
+  appliedPatchHistory: AppliedPatchSet[];
   projectInspection: ProjectInspection | null;
   sessionMemory: SessionMemory;
   timeline: TimelineEntry[];
@@ -102,8 +108,9 @@ type AppState = {
   setActiveTerminal: (id: string | null) => void;
   setPendingChanges: (changes: PendingAgentChange[]) => void;
   clearPendingChanges: () => void;
-  setLastAppliedChanges: (changes: PendingAgentChange[]) => void;
-  clearLastAppliedChanges: () => void;
+  pushAppliedPatchSet: (patchSet: AppliedPatchSet) => void;
+  popAppliedPatchSet: () => AppliedPatchSet | null;
+  clearAppliedPatchHistory: () => void;
   setProjectInspection: (inspection: ProjectInspection | null) => void;
   patchSessionMemory: (patch: Partial<SessionMemory>) => void;
   resetSessionMemory: () => void;
@@ -130,7 +137,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   settings: defaultLlmConfig(),
   audit: [],
   pendingChanges: [],
-  lastAppliedChanges: [],
+  appliedPatchHistory: [],
   projectInspection: null,
   sessionMemory: defaultSessionMemory(),
   timeline: [],
@@ -142,7 +149,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         tree,
         selectedPath: root,
         projectInspection: changed ? null : state.projectInspection,
-        lastAppliedChanges: changed ? [] : state.lastAppliedChanges,
+        appliedPatchHistory: changed ? [] : state.appliedPatchHistory,
         sessionMemory: changed
           ? { ...defaultSessionMemory(), terminalSessionIds: state.sessionMemory.terminalSessionIds }
           : state.sessionMemory,
@@ -194,8 +201,19 @@ export const useAppStore = create<AppState>((set, get) => ({
   setActiveTerminal: (activeTerminalId) => set({ activeTerminalId }),
   setPendingChanges: (pendingChanges) => set({ pendingChanges }),
   clearPendingChanges: () => set({ pendingChanges: [] }),
-  setLastAppliedChanges: (lastAppliedChanges) => set({ lastAppliedChanges }),
-  clearLastAppliedChanges: () => set({ lastAppliedChanges: [] }),
+  pushAppliedPatchSet: (patchSet) =>
+    set((state) => ({
+      appliedPatchHistory: [...state.appliedPatchHistory.slice(-29), patchSet]
+    })),
+  popAppliedPatchSet: () => {
+    const state = get();
+    if (!state.appliedPatchHistory.length) return null;
+    const next = [...state.appliedPatchHistory];
+    const patchSet = next.pop() || null;
+    set({ appliedPatchHistory: next });
+    return patchSet;
+  },
+  clearAppliedPatchHistory: () => set({ appliedPatchHistory: [] }),
   setProjectInspection: (projectInspection) => set({ projectInspection }),
   patchSessionMemory: (patch) =>
     set((state) => ({
