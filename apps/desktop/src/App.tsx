@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 
 import { CommandPalette } from "@/components/CommandPalette";
@@ -6,23 +6,47 @@ import { Button } from "@/components/ui/button";
 import logo from "@/assets/logo-ui.png";
 import { EditorPanel } from "@/panels/EditorPanel";
 import { ExplorerPanel } from "@/panels/ExplorerPanel";
+import { BottomPanel } from "@/panels/BottomPanel";
 import { RightPanel } from "@/panels/RightPanel";
-import { TerminalPanel } from "@/panels/TerminalPanel";
+import {
+  buildAgentPersistenceKey,
+  flattenWorkspaceFiles,
+  toWorkspaceRelativePath,
+  workspaceDisplayName
+} from "@/engines/workbenchEngine";
 import { basename } from "@/lib/utils";
 import { timelineFromAudit, timelineFromAuditList } from "@/lib/timeline";
 import { useAppStore } from "@/state/useAppStore";
+
+const RECENT_WORKSPACES_KEY = "lumen.recentWorkspaces.v1";
 
 function makeId() {
   return `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
 }
 
-function agentPersistenceKey(workspaceRoot: string) {
-  const safeWorkspace = workspaceRoot.replace(/[^A-Za-z0-9_-]+/g, "_").slice(-120);
-  return `lumen.agent.memory.v2.${safeWorkspace}`;
+function loadRecentWorkspaces() {
+  try {
+    const raw = localStorage.getItem(RECENT_WORKSPACES_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 12);
+  } catch {
+    return [];
+  }
+}
+
+function saveRecentWorkspaces(paths: string[]) {
+  try {
+    localStorage.setItem(RECENT_WORKSPACES_KEY, JSON.stringify(paths.slice(0, 12)));
+  } catch {
+    // Ignore local storage failures.
+  }
 }
 
 export default function App() {
   const workspaceRoot = useAppStore((state) => state.workspaceRoot);
+  const tree = useAppStore((state) => state.tree);
   const activeTabId = useAppStore((state) => state.activeTabId);
   const tabs = useAppStore((state) => state.tabs);
   const terminalTabs = useAppStore((state) => state.terminalTabs);
@@ -48,12 +72,14 @@ export default function App() {
   const toggleCommandPalette = useAppStore((state) => state.toggleCommandPalette);
   const setTerminalTabs = useAppStore((state) => state.setTerminalTabs);
   const setRightPanelTab = useAppStore((state) => state.setRightPanelTab);
+  const setBottomPanelTab = useAppStore((state) => state.setBottomPanelTab);
   const setAgentMode = useAppStore((state) => state.setAgentMode);
   const setTaskGraph = useAppStore((state) => state.setTaskGraph);
   const resetSessionMemory = useAppStore((state) => state.resetSessionMemory);
+  const [recentWorkspaces, setRecentWorkspaces] = useState<string[]>([]);
 
   const activeTab = tabs.find((tab) => tab.id === activeTabId) || null;
-  const workspaceName = workspaceRoot ? basename(workspaceRoot) : "No Workspace";
+  const workspaceName = workspaceDisplayName(workspaceRoot);
 
   const ingestAuditEntry = useCallback(
     (entry: Parameters<typeof appendAudit>[0]) => {
@@ -117,6 +143,16 @@ export default function App() {
     );
   }, [setTerminalTabs]);
 
+  const switchWorkspaceTo = useCallback(
+    async (root: string, source = "command_palette") => {
+      await window.lumen.workspace.setRoot({ root, source });
+      useAppStore.setState({ tabs: [], activeTabId: null, pendingChanges: [] });
+      await refreshTree();
+      await ensureTerminal();
+    },
+    [ensureTerminal, refreshTree]
+  );
+
   const hydrateWorkspaceContext = useCallback(async () => {
     if (!workspaceRoot) return;
 
@@ -155,6 +191,19 @@ export default function App() {
   }, [ensureTerminal, ingestAuditEntry, refreshTree, replaceAudit, replaceTimeline, setSettings]);
 
   useEffect(() => {
+    setRecentWorkspaces(loadRecentWorkspaces());
+  }, []);
+
+  useEffect(() => {
+    if (!workspaceRoot) return;
+    setRecentWorkspaces((current) => {
+      const next = [workspaceRoot, ...current.filter((item) => item !== workspaceRoot)].slice(0, 12);
+      saveRecentWorkspaces(next);
+      return next;
+    });
+  }, [workspaceRoot]);
+
+  useEffect(() => {
     void hydrateWorkspaceContext();
   }, [hydrateWorkspaceContext]);
 
@@ -165,7 +214,7 @@ export default function App() {
   useEffect(() => {
     if (!workspaceRoot) return;
     try {
-      const raw = localStorage.getItem(agentPersistenceKey(workspaceRoot));
+      const raw = localStorage.getItem(buildAgentPersistenceKey(workspaceRoot));
       if (!raw) return;
       const parsed = JSON.parse(raw) as {
         taskGraph?: unknown;
@@ -193,7 +242,7 @@ export default function App() {
     const timer = window.setTimeout(() => {
       try {
         localStorage.setItem(
-          agentPersistenceKey(workspaceRoot),
+          buildAgentPersistenceKey(workspaceRoot),
           JSON.stringify({
             updatedAt: new Date().toISOString(),
             agentMode,
@@ -238,12 +287,50 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [saveActiveTab, toggleCommandPalette, toggleExplorer, toggleTerminal]);
 
-  const commands = useMemo(
-    () => [
+  const commands = useMemo(() => {
+    const quickOpenCommands = flattenWorkspaceFiles(tree, settings.lowResourceMode ? 120 : 320).map((filePath) => ({
+      id: `open-file:${filePath}`,
+      label: `Open File: ${toWorkspaceRelativePath(workspaceRoot, filePath)}`,
+      run: () => void openFile(filePath)
+    }));
+    const workspaceSwitchCommands = recentWorkspaces
+      .filter((root) => root !== workspaceRoot)
+      .slice(0, 8)
+      .map((root) => ({
+        id: `switch-workspace:${root}`,
+        label: `Switch Workspace: ${workspaceDisplayName(root)} (${root})`,
+        run: () => void switchWorkspaceTo(root, "palette_recent")
+      }));
+
+    return [
       { id: "open-folder", label: "Open Folder", run: () => void openFolder() },
+      { id: "switch-workspace-dialog", label: "Switch Workspace (Folder Picker)", run: () => void openFolder() },
       { id: "save-file", label: "Save Active File", run: () => void saveActiveTab() },
       { id: "new-terminal", label: "New Terminal", run: () => void ensureTerminal().then(() => {}) },
-      { id: "toggle-terminal", label: "Toggle Terminal", run: () => toggleTerminal() },
+      {
+        id: "toggle-terminal",
+        label: "Toggle Terminal",
+        run: () => {
+          setBottomPanelTab("terminal");
+          toggleTerminal();
+        }
+      },
+      {
+        id: "open-problems",
+        label: "Open Problems Panel",
+        run: () => {
+          if (!useAppStore.getState().terminalVisible) toggleTerminal();
+          setBottomPanelTab("problems");
+        }
+      },
+      {
+        id: "open-run-logs",
+        label: "Open Run Logs Panel",
+        run: () => {
+          if (!useAppStore.getState().terminalVisible) toggleTerminal();
+          setBottomPanelTab("run_logs");
+        }
+      },
       { id: "toggle-explorer", label: "Toggle Explorer", run: () => toggleExplorer() },
       {
         id: "run-current-project",
@@ -342,10 +429,27 @@ export default function App() {
           setRightPanelTab("settings");
           void window.lumen.llm.test({ baseUrl: current.baseUrl, model: current.model, apiKey: current.apiKey }).catch(() => {});
         }
-      }
-    ],
-    [ensureTerminal, openFolder, saveActiveTab, setAgentMode, setRightPanelTab, setSettings, toggleExplorer, toggleTerminal]
-  );
+      },
+      ...workspaceSwitchCommands,
+      ...quickOpenCommands
+    ];
+  }, [
+    ensureTerminal,
+    openFile,
+    openFolder,
+    recentWorkspaces,
+    saveActiveTab,
+    setAgentMode,
+    setBottomPanelTab,
+    setRightPanelTab,
+    setSettings,
+    settings.lowResourceMode,
+    switchWorkspaceTo,
+    toggleExplorer,
+    toggleTerminal,
+    tree,
+    workspaceRoot
+  ]);
 
   return (
     <div className={`app-shell ${settings.compactMode ? "compact" : "normal"}`}>
@@ -403,7 +507,7 @@ export default function App() {
             <>
               <PanelResizeHandle className="h-1 bg-border/70 transition hover:bg-accent/40" />
               <Panel defaultSize={28} minSize={12}>
-                <TerminalPanel />
+                <BottomPanel />
               </Panel>
             </>
           )}

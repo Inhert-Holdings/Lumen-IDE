@@ -125,7 +125,7 @@ export function TerminalPanel() {
   }, [activeTerminalId, terminalTabs, setActiveTerminal]);
 
   return (
-    <div ref={rootRef} className="flex h-full flex-col border-t border-border bg-[#0a1018]">
+    <div ref={rootRef} className="flex h-full flex-col bg-[#0a1018]">
       <div className="border-b border-border px-2 py-1.5">
         <div className="mb-1.5 flex items-center justify-between">
           <div>

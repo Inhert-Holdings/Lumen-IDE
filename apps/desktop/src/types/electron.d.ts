@@ -153,6 +153,7 @@ declare global {
       workspace: {
         getRoot: () => Promise<{ root: string }>;
         openFolder: () => Promise<{ cancelled: boolean; root: string }>;
+        setRoot: (payload: { root: string; source?: string }) => Promise<{ ok: boolean; root: string }>;
         list: (payload?: { path?: string }) => Promise<{ root: string; tree: WorkspaceNode }>;
         read: (payload: { path: string }) => Promise<{ path: string; content: string }>;
         write: (payload: {
@@ -385,12 +386,42 @@ declare global {
           lowResourceMode: boolean;
           managedRuntime: { active: boolean; name: string; modelsPath: string };
           preview: { staticRunning: boolean; projectRunning: boolean; browserConnected: boolean };
+          workspaceWatcher: { active: boolean; eventCount: number; lastEventAt: string; reason: string };
+          workspaceIndex: {
+            status: string;
+            queued: boolean;
+            running: boolean;
+            filesIndexed: number;
+            dirsIndexed: number;
+            truncated: boolean;
+            lastIndexedAt: string;
+            lastDurationMs: number;
+            maxDepth: number;
+            maxEntries: number;
+            lastReason: string;
+            error: string;
+          };
           process: { pid: number; uptimeSec: number; memoryRss: number };
         }>;
         getHealth: () => Promise<{
           lowResourceMode: boolean;
           managedRuntime: { active: boolean; name: string; modelsPath: string };
           preview: { staticRunning: boolean; projectRunning: boolean; browserConnected: boolean };
+          workspaceWatcher: { active: boolean; eventCount: number; lastEventAt: string; reason: string };
+          workspaceIndex: {
+            status: string;
+            queued: boolean;
+            running: boolean;
+            filesIndexed: number;
+            dirsIndexed: number;
+            truncated: boolean;
+            lastIndexedAt: string;
+            lastDurationMs: number;
+            maxDepth: number;
+            maxEntries: number;
+            lastReason: string;
+            error: string;
+          };
           process: { pid: number; uptimeSec: number; memoryRss: number };
         }>;
       };

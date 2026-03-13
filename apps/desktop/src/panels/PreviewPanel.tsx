@@ -2,6 +2,8 @@ import { type MouseEvent, useCallback, useEffect, useMemo, useState } from "reac
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { diagnosticsPollIntervalMs, statusPollIntervalMs } from "@/engines/runtimeEngine";
+import { createTimelineEntry } from "@/lib/timeline";
 import { useAppStore } from "@/state/useAppStore";
 import type {
   PreviewBrowserDiagnostics,
@@ -14,11 +16,24 @@ import type {
 
 type VerificationStep = {
   id: string;
-  type: "connect" | "snapshot" | "screenshot" | "click" | "type" | "press";
+  type:
+    | "connect"
+    | "snapshot"
+    | "screenshot"
+    | "click"
+    | "type"
+    | "press"
+    | "checkpoint"
+    | "assert_text"
+    | "assert_url"
+    | "assert_console_clean"
+    | "assert_network_clean";
   selector?: string;
   text?: string;
   key?: string;
   url?: string;
+  label?: string;
+  expected?: string;
 };
 
 type VerificationFlow = {
@@ -28,7 +43,7 @@ type VerificationFlow = {
   updatedAt: string;
 };
 
-const VERIFICATION_FLOWS_KEY = "lumen.preview.verificationFlows.v1";
+const VERIFICATION_FLOWS_KEY = "lumen.preview.verificationFlows.v2";
 
 const EMPTY_INSPECTION: ProjectInspection = {
   rootPath: "",
@@ -100,7 +115,9 @@ function makeFlowId() {
 
 function loadVerificationFlows(): VerificationFlow[] {
   try {
-    const raw = localStorage.getItem(VERIFICATION_FLOWS_KEY);
+    const raw =
+      localStorage.getItem(VERIFICATION_FLOWS_KEY) ||
+      localStorage.getItem("lumen.preview.verificationFlows.v1");
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -126,6 +143,30 @@ function saveVerificationFlows(flows: VerificationFlow[]) {
   }
 }
 
+function normalizeCheckpointLabel(label: string) {
+  const trimmed = label.trim();
+  if (!trimmed) return "checkpoint";
+  return trimmed
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 36);
+}
+
+function describeStep(step: VerificationStep) {
+  if (step.type === "assert_text") return `assert text contains "${step.expected || ""}"`;
+  if (step.type === "assert_url") return `assert url contains "${step.expected || ""}"`;
+  if (step.type === "assert_console_clean") return "assert console has no errors";
+  if (step.type === "assert_network_clean") return "assert network has no errors";
+  if (step.type === "checkpoint") return `checkpoint "${step.label || "checkpoint"}"`;
+  if (step.type === "click") return `click ${step.selector || "(selector)"}`;
+  if (step.type === "type") return `type ${step.selector || "(selector)"}`;
+  if (step.type === "press") return `press ${step.key || "Enter"}`;
+  if (step.type === "screenshot") return "screenshot";
+  if (step.type === "snapshot") return "snapshot";
+  return "connect";
+}
+
 export function PreviewPanel() {
   const workspaceRoot = useAppStore((state) => state.workspaceRoot);
   const settings = useAppStore((state) => state.settings);
@@ -138,6 +179,7 @@ export function PreviewPanel() {
   const setProjectInspection = useAppStore((state) => state.setProjectInspection);
   const patchSessionMemory = useAppStore((state) => state.patchSessionMemory);
   const toggleTerminal = useAppStore((state) => state.toggleTerminal);
+  const appendTimeline = useAppStore((state) => state.appendTimeline);
 
   const [status, setStatus] = useState<PreviewStatus>(EMPTY_STATUS);
   const [projectPath, setProjectPath] = useState(".");
@@ -149,6 +191,8 @@ export function PreviewPanel() {
   const [selector, setSelector] = useState("");
   const [browserText, setBrowserText] = useState("");
   const [browserKey, setBrowserKey] = useState("Enter");
+  const [assertionValue, setAssertionValue] = useState("");
+  const [checkpointLabel, setCheckpointLabel] = useState("checkpoint");
   const [snapshot, setSnapshot] = useState<PreviewSnapshot>(EMPTY_SNAPSHOT);
   const [lastScreenshot, setLastScreenshot] = useState<PreviewScreenshot | null>(null);
   const [diagnostics, setDiagnostics] = useState<PreviewBrowserDiagnostics>(EMPTY_DIAGNOSTICS);
@@ -159,6 +203,7 @@ export function PreviewPanel() {
   const [lastRunFlowId, setLastRunFlowId] = useState("");
   const [flowName, setFlowName] = useState("Quick Verify");
   const [flowSteps, setFlowSteps] = useState<VerificationStep[]>([]);
+  const [flowImportText, setFlowImportText] = useState("");
   const [flowStatus, setFlowStatus] = useState("");
   const [recording, setRecording] = useState(false);
   const [recordedSteps, setRecordedSteps] = useState<VerificationStep[]>([]);
@@ -169,6 +214,21 @@ export function PreviewPanel() {
 
   const activeUrl = useMemo(() => customUrl.trim() || status.url, [customUrl, status.url]);
   const inspection = status.inspection || projectInspection || EMPTY_INSPECTION;
+
+  const recordPreviewTimeline = useCallback(
+    (title: string, detail: string, status: "running" | "done" | "failed" = "done") => {
+      appendTimeline(
+        createTimelineEntry({
+          phase: "verify",
+          status,
+          title,
+          detail,
+          source: "preview"
+        })
+      );
+    },
+    [appendTimeline]
+  );
 
   const syncInspection = useCallback((nextInspection: ProjectInspection) => {
     setProjectInspection(nextInspection);
@@ -268,7 +328,7 @@ export function PreviewPanel() {
     if (rightPanelTab !== "preview" && rightPanelTab !== "diagnostics") return;
     const timer = setInterval(() => {
       void loadStatus();
-    }, settings.lowResourceMode ? 8000 : 2500);
+    }, statusPollIntervalMs(settings.lowResourceMode));
     return () => clearInterval(timer);
   }, [loadStatus, rightPanelTab, settings.lowResourceMode]);
 
@@ -278,7 +338,7 @@ export function PreviewPanel() {
     void loadDiagnostics(false);
     const timer = setInterval(() => {
       void loadDiagnostics(false);
-    }, settings.lowResourceMode ? 12000 : 5000);
+    }, diagnosticsPollIntervalMs(settings.lowResourceMode));
     return () => clearInterval(timer);
   }, [loadDiagnostics, rightPanelTab, settings.lowResourceMode, status.browser.connected]);
 
@@ -290,6 +350,7 @@ export function PreviewPanel() {
   const runCurrentProject = async () => {
     setBusy(true);
     setError("");
+    recordPreviewTimeline("Preview project start", `Path: ${projectPath.trim() || "."}`, "running");
     try {
       const terminalId = await ensurePreviewTerminal();
       const inspectionResult = await window.lumen.workspace.inspect({ path: projectPath.trim() || "." });
@@ -304,8 +365,14 @@ export function PreviewPanel() {
       setStatus(next);
       patchSessionMemory({ activePreviewUrl: next.url, previewMode: next.mode });
       setRefreshKey((current) => current + 1);
+      recordPreviewTimeline("Preview project running", next.url || "Project preview started");
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed to run current project.");
+      recordPreviewTimeline(
+        "Preview project failed",
+        nextError instanceof Error ? nextError.message : "Failed to run current project.",
+        "failed"
+      );
     } finally {
       setBusy(false);
     }
@@ -314,6 +381,7 @@ export function PreviewPanel() {
   const serveStaticFolder = async () => {
     setBusy(true);
     setError("");
+    recordPreviewTimeline("Static preview start", `Path: ${staticPath.trim() || "."}`, "running");
     try {
       const inspectionResult = await window.lumen.workspace.inspect({ path: staticPath.trim() || "." });
       syncInspection(inspectionResult);
@@ -325,8 +393,14 @@ export function PreviewPanel() {
       setStatus(next);
       patchSessionMemory({ activePreviewUrl: next.url, previewMode: next.mode });
       setRefreshKey((current) => current + 1);
+      recordPreviewTimeline("Static preview running", next.url || "Static preview started");
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed to serve static preview.");
+      recordPreviewTimeline(
+        "Static preview failed",
+        nextError instanceof Error ? nextError.message : "Failed to serve static preview.",
+        "failed"
+      );
     } finally {
       setBusy(false);
     }
@@ -340,8 +414,10 @@ export function PreviewPanel() {
       setStatus(next);
       patchSessionMemory({ activePreviewUrl: "", previewMode: "idle" });
       setSnapshot(EMPTY_SNAPSHOT);
+      recordPreviewTimeline("Preview stopped", "Preview runtime stopped");
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed to stop preview.");
+      recordPreviewTimeline("Preview stop failed", nextError instanceof Error ? nextError.message : "Failed to stop preview.", "failed");
     } finally {
       setBusy(false);
     }
@@ -350,14 +426,21 @@ export function PreviewPanel() {
   const connectBrowser = async () => {
     setBusy(true);
     setError("");
+    recordPreviewTimeline("Browser connect", activeUrl || "Connect browser", "running");
     try {
       const result = await window.lumen.preview.browserConnect({ url: activeUrl || undefined });
       setSnapshot(result.snapshot);
       pushRecordedStep({ type: "connect", url: activeUrl || undefined });
       await loadStatus();
       await loadDiagnostics(false);
+      recordPreviewTimeline("Browser connected", result.url || activeUrl || "Connected");
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed to connect browser.");
+      recordPreviewTimeline(
+        "Browser connect failed",
+        nextError instanceof Error ? nextError.message : "Failed to connect browser.",
+        "failed"
+      );
     } finally {
       setBusy(false);
     }
@@ -467,8 +550,10 @@ export function PreviewPanel() {
       pushRecordedStep({ type: "screenshot", url: activeUrl || undefined });
       await loadStatus();
       await loadDiagnostics(false);
+      recordPreviewTimeline("Screenshot captured", result.path || "Screenshot saved");
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Screenshot failed.");
+      recordPreviewTimeline("Screenshot failed", nextError instanceof Error ? nextError.message : "Screenshot failed.", "failed");
     } finally {
       setBusy(false);
     }
@@ -493,6 +578,12 @@ export function PreviewPanel() {
     }
     if (type === "press") {
       step.key = browserKey.trim() || "Enter";
+    }
+    if (type === "assert_text" || type === "assert_url") {
+      step.expected = assertionValue.trim();
+    }
+    if (type === "checkpoint") {
+      step.label = checkpointLabel.trim() || "checkpoint";
     }
     setFlowSteps((current) => [...current, step]);
   };
@@ -530,6 +621,7 @@ export function PreviewPanel() {
     setRecordedSteps([]);
     setRecording(false);
     setFlowStatus(`Saved recorded flow "${next.name}".`);
+    recordPreviewTimeline("Verification macro saved", `${next.name} (${next.steps.length} steps)`);
   };
 
   const loadFlowToDraft = () => {
@@ -555,9 +647,11 @@ export function PreviewPanel() {
     setBusy(true);
     setError("");
     setFlowStatus(`Running "${flow.name}"...`);
+    recordPreviewTimeline("Verification flow started", `${flow.name} (${flow.steps.length} steps)`, "running");
     try {
       let latestSnapshot: PreviewSnapshot = EMPTY_SNAPSHOT;
-      for (const step of flow.steps) {
+      for (const [index, step] of flow.steps.entries()) {
+        setFlowStatus(`Step ${index + 1}/${flow.steps.length}: ${describeStep(step)}`);
         if (step.type === "connect") {
           const result = await window.lumen.preview.browserConnect({ url: step.url || activeUrl || undefined });
           latestSnapshot = result.snapshot;
@@ -572,6 +666,16 @@ export function PreviewPanel() {
         }
         if (step.type === "screenshot") {
           const shot = await window.lumen.preview.browserScreenshot({ url: step.url || activeUrl || undefined, fullPage: true });
+          setLastScreenshot(shot);
+          continue;
+        }
+        if (step.type === "checkpoint") {
+          const fileName = `checkpoint-${normalizeCheckpointLabel(step.label || "checkpoint")}-${Date.now()}.png`;
+          const shot = await window.lumen.preview.browserScreenshot({
+            url: step.url || activeUrl || undefined,
+            fullPage: true,
+            fileName
+          });
           setLastScreenshot(shot);
           continue;
         }
@@ -601,6 +705,42 @@ export function PreviewPanel() {
           });
           latestSnapshot = result;
           setSnapshot(result);
+          continue;
+        }
+        if (step.type === "assert_text") {
+          const expected = (step.expected || "").trim();
+          if (!expected) throw new Error("assert_text step requires expected text.");
+          if (!latestSnapshot.text) {
+            latestSnapshot = await window.lumen.preview.browserSnapshot();
+            setSnapshot(latestSnapshot);
+          }
+          if (!latestSnapshot.text.toLowerCase().includes(expected.toLowerCase())) {
+            throw new Error(`Assertion failed: text "${expected}" not found in snapshot.`);
+          }
+          continue;
+        }
+        if (step.type === "assert_url") {
+          const expected = (step.expected || "").trim();
+          if (!expected) throw new Error("assert_url step requires expected URL fragment.");
+          const current = await window.lumen.preview.status();
+          const currentUrl = (current.browser.url || current.url || "").trim();
+          if (!currentUrl.toLowerCase().includes(expected.toLowerCase())) {
+            throw new Error(`Assertion failed: URL "${currentUrl}" does not include "${expected}".`);
+          }
+          continue;
+        }
+        if (step.type === "assert_console_clean") {
+          const current = await window.lumen.preview.status();
+          if (current.browser.consoleErrors > 0) {
+            throw new Error(`Assertion failed: console has ${current.browser.consoleErrors} error(s).`);
+          }
+          continue;
+        }
+        if (step.type === "assert_network_clean") {
+          const current = await window.lumen.preview.status();
+          if (current.browser.networkErrors > 0) {
+            throw new Error(`Assertion failed: network has ${current.browser.networkErrors} error(s).`);
+          }
         }
       }
       await loadStatus();
@@ -609,10 +749,12 @@ export function PreviewPanel() {
       setFlowStatus(
         `Flow complete ✅ ${flow.steps.length} step(s). ${latestSnapshot.title ? `Last snapshot: ${latestSnapshot.title}` : ""}`.trim()
       );
+      recordPreviewTimeline("Verification flow complete", `${flow.name} (${flow.steps.length} steps)`);
     } catch (nextError) {
       const message = nextError instanceof Error ? nextError.message : "Verification flow failed.";
       setError(message);
       setFlowStatus(`Flow failed ❌ ${message}`);
+      recordPreviewTimeline("Verification flow failed", `${flow.name}: ${message}`, "failed");
     } finally {
       setBusy(false);
     }
@@ -632,6 +774,44 @@ export function PreviewPanel() {
     }
     setSelectedFlowId(flow.id);
     await runFlow(flow);
+  };
+
+  const exportSelectedFlow = async () => {
+    const flow = flows.find((item) => item.id === selectedFlowId);
+    if (!flow) return;
+    const payload = JSON.stringify({ name: flow.name, steps: flow.steps }, null, 2);
+    try {
+      await navigator.clipboard.writeText(payload);
+      setFlowStatus(`Copied "${flow.name}" JSON to clipboard.`);
+    } catch {
+      setFlowStatus("Clipboard unavailable. Copy from import/export box.");
+      setFlowImportText(payload);
+    }
+  };
+
+  const importFlowFromJson = () => {
+    const raw = flowImportText.trim();
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw) as { name?: string; steps?: VerificationStep[] };
+      if (!Array.isArray(parsed.steps) || !parsed.steps.length) {
+        throw new Error("Flow JSON must include a non-empty steps array.");
+      }
+      const name = (parsed.name || `Imported Flow ${new Date().toLocaleTimeString()}`).trim();
+      const imported: VerificationFlow = {
+        id: makeFlowId(),
+        name,
+        steps: parsed.steps.map((step) => ({ ...step, id: makeFlowId() })),
+        updatedAt: new Date().toISOString()
+      };
+      const nextFlows = [imported, ...flows].slice(0, 40);
+      persistFlows(nextFlows);
+      setSelectedFlowId(imported.id);
+      setFlowStatus(`Imported "${imported.name}" with ${imported.steps.length} step(s).`);
+      recordPreviewTimeline("Verification macro imported", `${imported.name} (${imported.steps.length} steps)`);
+    } catch (nextError) {
+      setFlowStatus(nextError instanceof Error ? nextError.message : "Failed to import flow JSON.");
+    }
   };
 
   return (
@@ -904,11 +1084,29 @@ export function PreviewPanel() {
               <pre className="lumen-scroll max-h-24 overflow-auto whitespace-pre-wrap break-words text-[11px] text-muted">
                 {recordedSteps
                   .slice(-20)
-                  .map((step, index) => `${index + 1}. ${step.type}${step.selector ? ` ${step.selector}` : ""}${step.key ? ` ${step.key}` : ""}`)
+                  .map((step, index) => `${index + 1}. ${describeStep(step)}`)
                   .join("\n")}
               </pre>
             </div>
           )}
+          <div className="mt-2 grid grid-cols-1 gap-2 xl:grid-cols-2">
+            <label className="block">
+              <div className="mb-1 text-muted">Assertion value (text/url fragment)</div>
+              <Input
+                value={assertionValue}
+                onChange={(event) => setAssertionValue(event.target.value)}
+                placeholder="Expected text or URL fragment"
+              />
+            </label>
+            <label className="block">
+              <div className="mb-1 text-muted">Checkpoint label</div>
+              <Input
+                value={checkpointLabel}
+                onChange={(event) => setCheckpointLabel(event.target.value)}
+                placeholder="homepage-loaded"
+              />
+            </label>
+          </div>
           <div className="mt-2 flex flex-wrap gap-2">
             <Button onClick={() => addFlowStep("connect")} disabled={busy || !activeUrl}>
               + Connect
@@ -928,6 +1126,21 @@ export function PreviewPanel() {
             <Button onClick={() => addFlowStep("press")} disabled={busy || !status.browser.connected}>
               + Press
             </Button>
+            <Button onClick={() => addFlowStep("checkpoint")} disabled={busy || !status.browser.connected}>
+              + Checkpoint
+            </Button>
+            <Button onClick={() => addFlowStep("assert_text")} disabled={busy || !assertionValue.trim()}>
+              + Assert Text
+            </Button>
+            <Button onClick={() => addFlowStep("assert_url")} disabled={busy || !assertionValue.trim()}>
+              + Assert URL
+            </Button>
+            <Button onClick={() => addFlowStep("assert_console_clean")} disabled={busy || !status.browser.connected}>
+              + Assert Console Clean
+            </Button>
+            <Button onClick={() => addFlowStep("assert_network_clean")} disabled={busy || !status.browser.connected}>
+              + Assert Network Clean
+            </Button>
           </div>
 
           {flowSteps.length > 0 && (
@@ -936,12 +1149,7 @@ export function PreviewPanel() {
               <div className="space-y-1">
                 {flowSteps.map((step, index) => (
                   <div key={step.id} className="flex items-center justify-between gap-2 rounded border border-border/60 px-2 py-1">
-                    <div className="truncate">
-                      {index + 1}. {step.type}
-                      {step.selector ? ` · ${step.selector}` : ""}
-                      {step.text ? ` · "${step.text}"` : ""}
-                      {step.key ? ` · ${step.key}` : ""}
-                    </div>
+                    <div className="truncate">{index + 1}. {describeStep(step)}</div>
                     <Button onClick={() => removeFlowStep(step.id)}>Remove</Button>
                   </div>
                 ))}
@@ -978,9 +1186,27 @@ export function PreviewPanel() {
               <Button onClick={loadFlowToDraft} disabled={!selectedFlowId}>
                 Load to Draft
               </Button>
+              <Button onClick={() => void exportSelectedFlow()} disabled={!selectedFlowId}>
+                Export JSON
+              </Button>
               <Button onClick={deleteSelectedFlow} disabled={!selectedFlowId}>
                 Delete
               </Button>
+            </div>
+            <div className="mt-2 space-y-2">
+              <Input
+                value={flowImportText}
+                onChange={(event) => setFlowImportText(event.target.value)}
+                placeholder='Paste flow JSON, for example {"name":"Smoke","steps":[...]}'
+              />
+              <div className="flex gap-2">
+                <Button onClick={importFlowFromJson} disabled={!flowImportText.trim()}>
+                  Import JSON
+                </Button>
+                <Button onClick={() => setFlowImportText("")} disabled={!flowImportText.trim()}>
+                  Clear JSON
+                </Button>
+              </div>
             </div>
             {flowStatus && <div className="mt-2 text-[11px] text-muted">{flowStatus}</div>}
           </div>

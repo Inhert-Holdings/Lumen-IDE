@@ -32,6 +32,7 @@ export type {
   AgentPhase,
   AppState,
   AppliedPatchSet,
+  BottomPanelTab,
   EditorTab,
   PendingAgentChange,
   RightPanelTab,

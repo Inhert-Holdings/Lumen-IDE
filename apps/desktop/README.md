@@ -51,19 +51,48 @@ Lumen IDE is a local-first desktop IDE built with Electron + React + TypeScript.
   - renderer bundle split (`vendor`, `vendor-monaco`, `vendor-terminal`, `vendor-layout`, `vendor-state`)
 - Store architecture:
   - renderer store split into slice modules: `ui`, `workspace`, `editor`, `terminal`, `preview`, `git`, `agent`, `policy`
+- Engine architecture:
+  - renderer engine modules split by responsibility: `workbench`, `runtime`, `agent`, `trust`
+  - renderer stays view/controller and dispatches through engine helpers
 - Project runtime detection improvements:
   - broader script detection (`dev`, `start`, `preview`, `serve`, `dev:*`, `start:*`)
   - framework URL defaults for Vite/Next/Astro/Nuxt/SvelteKit/CRA/Angular
   - Python detection expanded to FastAPI, Flask, and Django
 - Audit log with secret redaction
+- Workspace indexing/runtime orchestration:
+  - main-process scoped workspace watcher (active only when window is focused and low-resource mode is off)
+  - queued workspace index runs with low-resource-aware throttling
+  - runtime diagnostics exposes watcher/index health
 - Preview Mission Control:
   - browser screenshot capture
   - reusable verification flows (save/run/delete local flow macros)
   - interaction recorder for browser actions + rerun-last-flow shortcut
   - diagnostics panes with DOM summary, console events, and network event feed
+  - resilient project-preview fallback to static preview when terminal boot fails
 - Agent session persistence:
   - task graph + session working memory are persisted per workspace and restored on restart
+- Agent reliability upgrades:
+  - task graph generation upgraded with explicit verify/propose/apply nodes for edit tasks
+  - deterministic recovery policy suggestions (retry, inspect scripts, port conflict check, dependency install, compile localization, rollback hint)
 - Compact mode toggle and keyboard shortcuts
+- Command palette upgrades:
+  - fuzzy scoring and keyboard navigation (arrow keys + Enter)
+  - quick-open file entries generated from the active workspace tree
+  - recent workspace switch commands (one-window workspace hopping)
+- Main-process manager extraction:
+  - terminal orchestration and command coordinator moved to `electron/managers/terminalManager.cjs`
+  - policy/trust evaluation moved to `electron/managers/policyManager.cjs`
+  - runtime health + low-resource orchestration moved to `electron/managers/runtimeManager.cjs`
+- Local LLM streaming stability:
+  - local endpoints no longer use artificial stream timeouts
+  - localhost endpoint detection hardened for more URL input formats
+- Preview verification macro upgrades:
+  - export/import verification flow JSON
+  - timeline events for preview run/connect/flow execution
+- Agent planning/recovery upgrades:
+  - objective list generation alongside plan lines
+  - richer planner context with workspace file snippets
+  - recovery retries original failed command after successful recovery action
 
 ## Presets
 
@@ -95,6 +124,12 @@ From repository root, you can also run:
 
 ```powershell
 pnpm dev
+```
+
+Run the automated desktop smoke suite (Electron + Playwright + mock local LLM):
+
+```powershell
+pnpm --filter @lumen/desktop smoke:e2e
 ```
 
 ## Build Windows artifact

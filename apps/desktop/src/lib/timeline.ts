@@ -86,6 +86,16 @@ export function timelineFromAudit(entry: AuditEntry): TimelineEntry | null {
         detail: text(detail.reason) || "Preview runtime stopped",
         source: "preview"
       });
+    case "preview.project_stop":
+      return createTimelineEntry({
+        id: entry.id,
+        timestamp: entry.timestamp,
+        phase: "runtime",
+        status: "info",
+        title: "Project preview stopped",
+        detail: text(detail.reason) || text(detail.command) || "Project preview runtime stopped",
+        source: "preview"
+      });
     case "preview.browser_connect":
       return createTimelineEntry({
         id: entry.id,
@@ -215,6 +225,26 @@ export function timelineFromAudit(entry: AuditEntry): TimelineEntry | null {
         title: "Git push completed",
         detail: "Remote branch updated",
         source: "git"
+      });
+    case "runtime.low_resource_mode":
+      return createTimelineEntry({
+        id: entry.id,
+        timestamp: entry.timestamp,
+        phase: "runtime",
+        status: "info",
+        title: "Low resource mode changed",
+        detail: detail.enabled ? "Low resource mode enabled" : "Low resource mode disabled",
+        source: "system"
+      });
+    case "policy.set_preset":
+      return createTimelineEntry({
+        id: entry.id,
+        timestamp: entry.timestamp,
+        phase: "scope",
+        status: "info",
+        title: "Trust preset changed",
+        detail: text(detail.preset) || "Permission preset updated",
+        source: "system"
       });
     default:
       if (entry.action.startsWith("agent.")) {

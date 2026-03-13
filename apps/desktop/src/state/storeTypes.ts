@@ -89,6 +89,8 @@ export type RightPanelTab =
   | "audit"
   | "diagnostics";
 
+export type BottomPanelTab = "terminal" | "problems" | "run_logs";
+
 export type AgentMode = "manual" | "live_build";
 
 export function createDefaultSessionMemory(): SessionMemory {
@@ -112,10 +114,12 @@ export type UiSlice = {
   terminalVisible: boolean;
   commandPaletteOpen: boolean;
   rightPanelTab: RightPanelTab;
+  bottomPanelTab: BottomPanelTab;
   toggleExplorer: () => void;
   toggleTerminal: () => void;
   toggleCommandPalette: (open?: boolean) => void;
   setRightPanelTab: (tab: RightPanelTab) => void;
+  setBottomPanelTab: (tab: BottomPanelTab) => void;
 };
 
 export type WorkspaceSlice = {

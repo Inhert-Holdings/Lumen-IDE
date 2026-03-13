@@ -106,11 +106,14 @@ export function defaultLlmConfig(): LlmConfig {
 }
 
 export function isLocalBaseUrl(baseUrl: string): boolean {
+  const value = String(baseUrl || "").trim();
+  if (!value) return false;
+  const candidate = /^[a-z]+:\/\//i.test(value) ? value : `http://${value}`;
   try {
-    const parsed = new URL(baseUrl);
-    return ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname);
+    const parsed = new URL(candidate);
+    return ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname.replace(/^\[|\]$/g, ""));
   } catch {
-    return false;
+    return /(^|\/\/)(localhost|127\.0\.0\.1|\[::1\]|::1)(:\d+)?(\/|$)/i.test(value);
   }
 }
 

@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildTaskGraph,
+  deriveRecoverySuggestions,
   evaluatePolicyDecision,
   extractActionsFromText,
   isReadOnlyCommand,
@@ -149,4 +151,30 @@ test("autonomous loop records denied approvals without executing tool", async ()
   assert.equal(result.actionResults.length, 1);
   assert.equal(result.actionResults[0]?.skipped, true);
   assert.equal(result.actionResults[0]?.result.error, "Action denied by user");
+});
+
+test("buildTaskGraph appends verify/propose/apply nodes when file writes exist", () => {
+  const nodes = buildTaskGraph("Update homepage", [
+    { type: "read_file", path: "src/App.tsx" },
+    { type: "write_file", path: "src/App.tsx", content: "next" }
+  ]);
+
+  assert.equal(nodes.length, 5);
+  assert.equal(nodes[2]?.phase, "verify");
+  assert.equal(nodes[3]?.phase, "propose");
+  assert.equal(nodes[4]?.phase, "apply");
+});
+
+test("deriveRecoverySuggestions includes dependency install and compile localization", () => {
+  const suggestions = deriveRecoverySuggestions({
+    failedAction: { type: "run_cmd", command: "pnpm dev" },
+    error: "Cannot find module react-refresh",
+    output: "src/App.tsx:42:5 compile failed",
+    hasPendingChanges: true,
+    recoveryAttempt: 3
+  });
+
+  assert.equal(suggestions.some((item) => item.policy === "install_dependencies"), true);
+  assert.equal(suggestions.some((item) => item.policy === "localize_compile_error"), true);
+  assert.equal(suggestions.some((item) => item.policy === "rollback_patch"), true);
 });

@@ -7,6 +7,21 @@ type RuntimeHealth = {
   lowResourceMode: boolean;
   managedRuntime: { active: boolean; name: string; modelsPath: string };
   preview: { staticRunning: boolean; projectRunning: boolean; browserConnected: boolean };
+  workspaceWatcher: { active: boolean; eventCount: number; lastEventAt: string; reason: string };
+  workspaceIndex: {
+    status: string;
+    queued: boolean;
+    running: boolean;
+    filesIndexed: number;
+    dirsIndexed: number;
+    truncated: boolean;
+    lastIndexedAt: string;
+    lastDurationMs: number;
+    maxDepth: number;
+    maxEntries: number;
+    lastReason: string;
+    error: string;
+  };
   process: { pid: number; uptimeSec: number; memoryRss: number };
 };
 
@@ -56,6 +71,19 @@ export function DiagnosticsPanel() {
           <div>Managed runtime: {health?.managedRuntime.active ? `${health.managedRuntime.name} active` : "inactive"}</div>
           <div>Preview: {health?.preview.projectRunning ? "project" : health?.preview.staticRunning ? "static" : "idle"}</div>
           <div>Browser connected: {health?.preview.browserConnected ? "yes" : "no"}</div>
+        </div>
+
+        <div className="rounded border border-border bg-black/20 p-2">
+          <div className="mb-1 text-[10px] uppercase text-muted">Workspace Watch/Index</div>
+          <div>Watcher: {health?.workspaceWatcher.active ? "active" : "paused"}</div>
+          <div>Watch events: {health?.workspaceWatcher.eventCount || 0}</div>
+          <div>Watch reason: {health?.workspaceWatcher.reason || "n/a"}</div>
+          <div>Index status: {health?.workspaceIndex.status || "idle"}</div>
+          <div>Indexed: {health?.workspaceIndex.filesIndexed || 0} files / {health?.workspaceIndex.dirsIndexed || 0} dirs</div>
+          <div>Depth/limit: {health?.workspaceIndex.maxDepth || 0} / {health?.workspaceIndex.maxEntries || 0}</div>
+          <div>Last index: {health?.workspaceIndex.lastIndexedAt ? new Date(health.workspaceIndex.lastIndexedAt).toLocaleTimeString() : "never"}</div>
+          <div>Index duration: {health?.workspaceIndex.lastDurationMs || 0}ms</div>
+          {health?.workspaceIndex.error ? <div className="text-bad">Index error: {health.workspaceIndex.error}</div> : null}
         </div>
 
         <div className="rounded border border-border bg-black/20 p-2">

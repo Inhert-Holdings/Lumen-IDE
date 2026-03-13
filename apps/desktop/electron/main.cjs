@@ -8,6 +8,10 @@ const { app, BrowserWindow, dialog, ipcMain, safeStorage } = require("electron")
 const pty = require("node-pty");
 const { chromium } = require("playwright-core");
 const simpleGit = require("simple-git");
+const { registerIpcHandlers } = require("./ipc/registerHandlers.cjs");
+const { createPolicyManager } = require("./managers/policyManager.cjs");
+const { createRuntimeManager } = require("./managers/runtimeManager.cjs");
+const { createTerminalManager } = require("./managers/terminalManager.cjs");
 
 const APP_ROOT = path.resolve(__dirname, "..");
 const SETTINGS_FILE = "lumen-settings.json";
@@ -55,10 +59,34 @@ const DEFAULT_SETTINGS = {
   permissionPreset: "full_local_workspace"
 };
 
+function isBrokenPipeError(error) {
+  return Boolean(error && (error.code === "EPIPE" || error.errno === -4047));
+}
+
+function guardProcessStream(stream) {
+  if (!stream || typeof stream.on !== "function") return;
+  stream.on("error", (error) => {
+    if (isBrokenPipeError(error)) return;
+    throw error;
+  });
+}
+
+guardProcessStream(process.stdout);
+guardProcessStream(process.stderr);
+
+process.on("uncaughtException", (error) => {
+  if (isBrokenPipeError(error)) return;
+  throw error;
+});
+
+process.on("unhandledRejection", (reason) => {
+  if (isBrokenPipeError(reason)) return;
+  if (reason instanceof Error) throw reason;
+  throw new Error(String(reason));
+});
+
 let workspaceRoot = APP_ROOT;
 let mainWindow;
-let terminalCounter = 0;
-const terminals = new Map();
 const llmStreams = new Map();
 let managedRuntime = null;
 let runtimeIdleTimer = null;
@@ -66,6 +94,29 @@ let lastRuntimeActivityAt = 0;
 let previewRuntime = null;
 let previewProjectRuntime = null;
 let previewBrowserRuntime = null;
+let workspaceWindowActive = true;
+const workspaceWatcherState = {
+  watcher: null,
+  active: false,
+  eventCount: 0,
+  lastEventAt: "",
+  lastReason: ""
+};
+const workspaceIndexState = {
+  status: "idle",
+  queued: false,
+  running: false,
+  lastIndexedAt: "",
+  lastDurationMs: 0,
+  filesIndexed: 0,
+  dirsIndexed: 0,
+  truncated: false,
+  maxDepth: 0,
+  maxEntries: 0,
+  lastReason: "",
+  error: ""
+};
+let workspaceIndexTimer = null;
 const agentRuntimeState = {
   mode: "manual",
   taskGraph: []
@@ -225,6 +276,8 @@ function saveSettings(input) {
     lowResourceMode: next.lowResourceMode,
     permissionPreset: next.permissionPreset
   });
+  syncWorkspaceWatcher("settings_save");
+  scheduleWorkspaceIndex("settings_save");
   return next;
 }
 
@@ -247,6 +300,152 @@ function getWorkspaceScanLimits() {
     return { maxTreeEntries: 2000, maxDepth: 3 };
   }
   return { maxTreeEntries: MAX_TREE_ENTRIES, maxDepth: 5 };
+}
+
+function scanWorkspaceStats(rootPath, maxDepth, maxEntries) {
+  const counts = { files: 0, dirs: 0, truncated: false };
+
+  function walk(currentPath, depth) {
+    if (counts.truncated) return;
+    if (depth > maxDepth) return;
+    if (counts.files + counts.dirs >= maxEntries) {
+      counts.truncated = true;
+      return;
+    }
+
+    let entries = [];
+    try {
+      entries = fs.readdirSync(currentPath, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (counts.files + counts.dirs >= maxEntries) {
+        counts.truncated = true;
+        return;
+      }
+      if (entry.isDirectory()) {
+        if (EXCLUDED_DIRS.has(entry.name)) continue;
+        counts.dirs += 1;
+        walk(path.join(currentPath, entry.name), depth + 1);
+      } else {
+        counts.files += 1;
+      }
+    }
+  }
+
+  walk(rootPath, 0);
+  return counts;
+}
+
+function stopWorkspaceWatcher(reason = "manual") {
+  if (!workspaceWatcherState.watcher) {
+    workspaceWatcherState.active = false;
+    workspaceWatcherState.lastReason = reason;
+    return;
+  }
+  try {
+    workspaceWatcherState.watcher.close();
+  } catch {
+    // Ignore watcher close errors.
+  }
+  workspaceWatcherState.watcher = null;
+  workspaceWatcherState.active = false;
+  workspaceWatcherState.lastReason = reason;
+}
+
+function startWorkspaceWatcher(reason = "manual") {
+  stopWorkspaceWatcher("restart");
+  try {
+    const watcher = fs.watch(workspaceRoot, { recursive: true }, (_eventType, fileName) => {
+      const changed = String(fileName || "");
+      if (!changed || changed.startsWith(".git")) return;
+      if (changed.includes("node_modules") || changed.includes("\\dist\\") || changed.includes("/dist/")) return;
+      workspaceWatcherState.eventCount += 1;
+      workspaceWatcherState.lastEventAt = new Date().toISOString();
+      scheduleWorkspaceIndex("watch_event");
+    });
+    watcher.on("error", () => {
+      // Ignore transient watcher transport errors.
+    });
+    workspaceWatcherState.watcher = watcher;
+    workspaceWatcherState.active = true;
+    workspaceWatcherState.lastReason = reason;
+  } catch {
+    workspaceWatcherState.watcher = null;
+    workspaceWatcherState.active = false;
+    workspaceWatcherState.lastReason = "watcher_error";
+  }
+}
+
+function shouldWorkspaceWatcherRun() {
+  const settings = loadSettings();
+  return !settings.lowResourceMode && workspaceWindowActive;
+}
+
+function syncWorkspaceWatcher(reason = "sync") {
+  if (shouldWorkspaceWatcherRun()) {
+    if (!workspaceWatcherState.watcher) {
+      startWorkspaceWatcher(reason);
+    }
+    return;
+  }
+  stopWorkspaceWatcher(reason);
+}
+
+function runWorkspaceIndex(reason = "manual") {
+  if (workspaceIndexState.running) {
+    workspaceIndexState.queued = true;
+    workspaceIndexState.lastReason = reason;
+    return;
+  }
+  workspaceIndexState.running = true;
+  workspaceIndexState.status = "indexing";
+  workspaceIndexState.lastReason = reason;
+  const startedAt = Date.now();
+  const limits = getWorkspaceScanLimits();
+  const maxDepth = Math.min(8, Math.max(2, limits.maxDepth + 1));
+  const maxEntries = Math.min(30000, Math.max(3000, limits.maxTreeEntries * 2));
+  workspaceIndexState.maxDepth = maxDepth;
+  workspaceIndexState.maxEntries = maxEntries;
+  workspaceIndexState.error = "";
+
+  try {
+    const stats = scanWorkspaceStats(workspaceRoot, maxDepth, maxEntries);
+    workspaceIndexState.filesIndexed = stats.files;
+    workspaceIndexState.dirsIndexed = stats.dirs;
+    workspaceIndexState.truncated = stats.truncated;
+    workspaceIndexState.lastIndexedAt = new Date().toISOString();
+    workspaceIndexState.lastDurationMs = Date.now() - startedAt;
+    workspaceIndexState.status = "idle";
+  } catch (error) {
+    workspaceIndexState.status = "error";
+    workspaceIndexState.error = error instanceof Error ? error.message : "Workspace indexing failed.";
+  } finally {
+    workspaceIndexState.running = false;
+    if (workspaceIndexState.queued) {
+      workspaceIndexState.queued = false;
+      scheduleWorkspaceIndex("queued_followup");
+    }
+  }
+}
+
+function scheduleWorkspaceIndex(reason = "manual") {
+  workspaceIndexState.lastReason = reason;
+  if (workspaceIndexState.running) {
+    workspaceIndexState.queued = true;
+    return;
+  }
+  if (workspaceIndexTimer) {
+    clearTimeout(workspaceIndexTimer);
+    workspaceIndexTimer = null;
+  }
+  const settings = loadSettings();
+  workspaceIndexTimer = setTimeout(() => {
+    workspaceIndexTimer = null;
+    runWorkspaceIndex(reason);
+  }, settings.lowResourceMode ? 3500 : 1200);
 }
 
 function listDirectoryTree(basePath, maxDepth = 5, maxTreeEntries = MAX_TREE_ENTRIES) {
@@ -395,6 +594,7 @@ function writeFile(filePath, content, options = {}) {
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, content, "utf8");
   audit("files.write", { path: target, bytes: content.length });
+  scheduleWorkspaceIndex("write_file");
   return { ok: true };
 }
 
@@ -403,6 +603,7 @@ function createFile(filePath) {
   fs.mkdirSync(path.dirname(target), { recursive: true });
   if (!fs.existsSync(target)) fs.writeFileSync(target, "", "utf8");
   audit("files.create", { path: target });
+  scheduleWorkspaceIndex("create_file");
   return { ok: true };
 }
 
@@ -410,6 +611,7 @@ function createDirectory(dirPath) {
   const target = safeResolve(dirPath);
   fs.mkdirSync(target, { recursive: true });
   audit("files.mkdir", { path: target });
+  scheduleWorkspaceIndex("create_dir");
   return { ok: true };
 }
 
@@ -419,6 +621,7 @@ function renamePath(sourcePath, destinationPath) {
   fs.mkdirSync(path.dirname(destination), { recursive: true });
   fs.renameSync(source, destination);
   audit("files.rename", { source, destination });
+  scheduleWorkspaceIndex("rename_path");
   return { ok: true };
 }
 
@@ -447,6 +650,7 @@ function deletePath(targetPath, options = {}) {
   const target = safeResolve(targetPath);
   fs.rmSync(target, { recursive: true, force: true });
   audit("files.delete", { path: target });
+  scheduleWorkspaceIndex("delete_path");
   return { ok: true };
 }
 
@@ -1617,6 +1821,44 @@ async function startPreviewServer(payload = {}) {
   return getPreviewStatus();
 }
 
+function spawnPreviewProjectFallbackProcess(project, terminalRecord, terminalId) {
+  const shell = process.platform === "win32" ? "powershell.exe" : process.env.SHELL || "bash";
+  const args =
+    process.platform === "win32"
+      ? [
+          "-NoLogo",
+          "-NoProfile",
+          "-Command",
+          `Set-Location -LiteralPath '${project.rootPath.replace(/'/g, "''")}'; ${project.command}`
+        ]
+      : ["-lc", `cd '${project.rootPath.replace(/'/g, "\\'")}'; ${project.command}`];
+
+  const child = spawn(shell, args, {
+    cwd: project.rootPath,
+    env: process.env,
+    windowsHide: true
+  });
+
+  const forward = (chunk) => {
+    const text = chunk.toString();
+    appendTerminalOutput(terminalRecord, text);
+    emitTerminalData(terminalId, text);
+  };
+
+  child.stdout.on("data", forward);
+  child.stderr.on("data", forward);
+  child.on("close", (code) => {
+    emitTerminalData(terminalId, `\r\n[preview process exited with code ${code ?? 0}]\r\n`);
+  });
+
+  audit("preview.project_fallback_spawn", {
+    command: project.command,
+    rootPath: project.rootPath,
+    terminalId
+  });
+  return child;
+}
+
 async function stopPreviewProject(reason = "manual") {
   if (!previewProjectRuntime) {
     return { ok: true, ...getPreviewStatus() };
@@ -1624,6 +1866,13 @@ async function stopPreviewProject(reason = "manual") {
 
   const runtime = previewProjectRuntime;
   previewProjectRuntime = null;
+  if (runtime.process) {
+    try {
+      runtime.process.kill();
+    } catch {
+      // Ignore process stop failures.
+    }
+  }
   if (runtime.terminalId && terminals.has(runtime.terminalId)) {
     try {
       writeTerminal(runtime.terminalId, "\u0003");
@@ -1657,14 +1906,55 @@ async function startPreviewProject(payload = {}) {
   writeTerminal(terminalId, `\u0003`);
   await sleep(200);
   writeTerminal(terminalId, `${project.command}\r`);
-  const readiness = await waitForPreviewUrlInTerminal(terminalRecord, project.url);
+  let detachedProcess = null;
+  let readiness = null;
+  try {
+    readiness = await waitForPreviewUrlInTerminal(terminalRecord, project.url);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    audit("preview.project_terminal_boot_failed", {
+      command: project.command,
+      rootPath: project.rootPath,
+      terminalId,
+      error: message
+    });
+    detachedProcess = spawnPreviewProjectFallbackProcess(project, terminalRecord, terminalId);
+    try {
+      readiness = await waitForPreviewUrlInTerminal(terminalRecord, project.url);
+    } catch (fallbackError) {
+      if (detachedProcess) {
+        try {
+          detachedProcess.kill();
+        } catch {
+          // Ignore fallback process kill errors.
+        }
+      }
+      const staticRoot = String(project.inspection?.staticRoot || "");
+      const entryFile = String(project.inspection?.entryFile || "index.html");
+      if (staticRoot && fs.existsSync(path.join(staticRoot, entryFile))) {
+        audit("preview.project_fallback_static", {
+          rootPath: staticRoot,
+          entryFile,
+          command: project.command,
+          terminalId
+        });
+        return await startPreviewServer({
+          path: staticRoot,
+          entry: entryFile,
+          port: Number(payload?.port) || PREVIEW_DEFAULT_PORT
+        });
+      }
+      throw fallbackError;
+    }
+  }
 
   previewProjectRuntime = {
     ...project,
     url: readiness.url,
     terminalId,
     startedAt: new Date().toISOString(),
-    lastDetectedUrl: readiness.detectedUrl || readiness.url
+    lastDetectedUrl: readiness.detectedUrl || readiness.url,
+    process: detachedProcess
   };
   audit("preview.project_start", {
     rootPath: project.rootPath,
@@ -1683,11 +1973,14 @@ async function stopPreview(reason = "manual") {
 }
 
 function isLocalUrl(baseUrl) {
+  const value = String(baseUrl || "").trim();
+  if (!value) return false;
+  const candidate = /^[a-z]+:\/\//i.test(value) ? value : `http://${value}`;
   try {
-    const parsed = new URL(baseUrl);
-    return ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname);
+    const parsed = new URL(candidate);
+    return ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname.replace(/^\[|\]$/g, ""));
   } catch {
-    return false;
+    return /(^|\/\/)(localhost|127\.0\.0\.1|\[::1\]|::1)(:\d+)?(\/|$)/i.test(value);
   }
 }
 
@@ -1721,185 +2014,62 @@ function isReadOnlyCommand(command) {
   return allowlist.some((pattern) => pattern.test(normalized));
 }
 
+const policyManager = createPolicyManager({
+  loadSettings,
+  saveSettings,
+  audit,
+  agentRuntimeState,
+  policyPresets: POLICY_PRESETS,
+  defaultPreset: DEFAULT_SETTINGS.permissionPreset,
+  isReadOnlyCommand
+});
+
+const runtimeManager = createRuntimeManager({
+  loadSettings,
+  saveSettings,
+  audit,
+  syncWorkspaceWatcher,
+  scheduleWorkspaceIndex,
+  getManagedRuntime: () => managedRuntime,
+  getPreviewState: () => ({
+    staticRuntime: previewRuntime,
+    projectRuntime: previewProjectRuntime,
+    browserRuntime: previewBrowserRuntime
+  }),
+  getWorkspaceWatcherState: () => workspaceWatcherState,
+  getWorkspaceIndexState: () => workspaceIndexState
+});
+
 function normalizePolicyPreset(value) {
-  const preset = String(value || "").trim();
-  return POLICY_PRESETS.has(preset) ? preset : DEFAULT_SETTINGS.permissionPreset;
+  return policyManager.normalizePolicyPreset(value);
 }
 
 function riskForActionType(actionType, command = "") {
-  if (
-    actionType === "git_push" ||
-    actionType === "git_commit" ||
-    actionType === "git_merge" ||
-    actionType === "git_rebase" ||
-    actionType === "git_cherry_pick"
-  ) {
-    return "risky";
-  }
-  if (actionType === "write_file" || actionType === "delete_file") return "uncertain";
-  if (actionType === "run_cmd") {
-    return isReadOnlyCommand(command || "") ? "likely" : "risky";
-  }
-  if (["preview_click", "preview_type", "preview_press", "preview_start", "preview_screenshot"].includes(actionType)) {
-    return "likely";
-  }
-  return "obvious";
-}
-
-function presetAllowsActionType(preset, actionType) {
-  const readActions = new Set([
-    "list_dir",
-    "read_file",
-    "search_files",
-    "git_status",
-    "git_diff",
-    "preview_status",
-    "preview_snapshot",
-    "preview_screenshot"
-  ]);
-  const editActions = new Set(["write_file", "delete_file"]);
-  const previewActions = new Set(["preview_start", "preview_click", "preview_type", "preview_press"]);
-  const gitActions = new Set([
-    "git_stage",
-    "git_unstage",
-    "git_merge",
-    "git_rebase",
-    "git_cherry_pick",
-    "git_commit",
-    "git_push"
-  ]);
-
-  if (preset === "read_only") return readActions.has(actionType);
-  if (preset === "local_edit_only") return readActions.has(actionType) || editActions.has(actionType);
-  if (preset === "preview_operator") return readActions.has(actionType) || previewActions.has(actionType);
-  if (preset === "git_operator") return readActions.has(actionType) || gitActions.has(actionType);
-  if (preset === "local_build_mode") {
-    return (
-      readActions.has(actionType) ||
-      editActions.has(actionType) ||
-      previewActions.has(actionType) ||
-      actionType === "run_cmd" ||
-      actionType === "git_stage" ||
-      actionType === "git_unstage"
-    );
-  }
-  return true;
+  return policyManager.riskForActionType(actionType, command);
 }
 
 function evaluatePolicyDecision(payload = {}) {
-  const settings = loadSettings();
-  const preset = normalizePolicyPreset(payload.preset || settings.permissionPreset);
-  const actionType = String(payload.actionType || "").trim();
-  const command = String(payload.command || "");
-  const risk = riskForActionType(actionType, command);
-  if (actionType === "git_push" && !settings.onlineMode) {
-    return {
-      preset,
-      actionType,
-      risk,
-      allowed: false,
-      requiresApproval: false,
-      reason: "Online mode is disabled."
-    };
-  }
-
-  const allowed = presetAllowsActionType(preset, actionType);
-  if (!allowed) {
-    return {
-      preset,
-      actionType,
-      risk,
-      allowed: false,
-      requiresApproval: false,
-      reason: `Action ${actionType} blocked by ${preset} preset.`
-    };
-  }
-
-  const requiresApproval = preset === "trusted_workspace_profile" ? risk === "risky" : risk === "uncertain" || risk === "risky";
-  return {
-    preset,
-    actionType,
-    risk,
-    allowed: true,
-    requiresApproval,
-    reason: requiresApproval ? `Requires approval (${risk} risk).` : `Allowed (${risk} risk).`
-  };
+  return policyManager.evaluatePolicyDecision(payload);
 }
 
 function enforceAgentPolicy(payload, actionType, command = "") {
-  if (String(payload?.source || "").trim() !== "agent") return;
-  const decision = evaluatePolicyDecision({
-    actionType,
-    command,
-    preset: payload?.preset || ""
-  });
-  audit("policy.decision", {
-    actionType,
-    allowed: decision.allowed,
-    requiresApproval: decision.requiresApproval,
-    risk: decision.risk,
-    preset: decision.preset,
-    source: "agent",
-    mode: agentRuntimeState.mode
-  });
-  if (!decision.allowed) {
-    throw new Error(decision.reason);
-  }
-  if (decision.requiresApproval && !payload?.approved) {
-    throw new Error(`${actionType} requires explicit approval by policy.`);
-  }
+  return policyManager.enforceAgentPolicy(payload, actionType, command);
 }
 
 function getPolicyState() {
-  const settings = loadSettings();
-  return {
-    preset: normalizePolicyPreset(settings.permissionPreset),
-    presets: Array.from(POLICY_PRESETS)
-  };
+  return policyManager.getPolicyState();
 }
 
 function setPolicyPreset(nextPreset) {
-  const settings = loadSettings();
-  const preset = normalizePolicyPreset(nextPreset);
-  saveSettings({
-    ...settings,
-    permissionPreset: preset
-  });
-  audit("policy.set_preset", { preset });
-  return getPolicyState();
+  return policyManager.setPolicyPreset(nextPreset);
 }
 
 function getRuntimeHealth() {
-  const settings = loadSettings();
-  return {
-    lowResourceMode: Boolean(settings.lowResourceMode),
-    managedRuntime: {
-      active: Boolean(managedRuntime?.process && !managedRuntime.process.killed),
-      name: managedRuntime?.name || "",
-      modelsPath: managedRuntime?.modelsPath || ""
-    },
-    preview: {
-      staticRunning: Boolean(previewRuntime),
-      projectRunning: Boolean(previewProjectRuntime),
-      browserConnected: Boolean(previewBrowserRuntime?.page)
-    },
-    process: {
-      pid: process.pid,
-      uptimeSec: Math.round(process.uptime()),
-      memoryRss: process.memoryUsage().rss
-    }
-  };
+  return runtimeManager.getRuntimeHealth();
 }
 
 function setLowResourceMode(enabled) {
-  const settings = loadSettings();
-  const next = saveSettings({
-    ...settings,
-    lowResourceMode: Boolean(enabled),
-    helperEnabled: enabled ? false : settings.helperEnabled
-  });
-  audit("runtime.low_resource_mode", { enabled: next.lowResourceMode, helperEnabled: next.helperEnabled });
-  return getRuntimeHealth();
+  return runtimeManager.setLowResourceMode(enabled);
 }
 
 function buildLlmHeaders(config) {
@@ -2485,231 +2655,48 @@ function emitTerminalData(id, data) {
   }
 }
 
-function createTerminal({ cols = 120, rows = 30 } = {}) {
-  const id = `term-${++terminalCounter}`;
-  const shell = process.platform === "win32" ? "powershell.exe" : process.env.SHELL || "bash";
-
-  const ptyProcess = pty.spawn(shell, [], {
-    name: "xterm-256color",
-    cols,
-    rows,
-    cwd: workspaceRoot,
-    env: process.env
-  });
-  const record = {
-    id,
-    shell,
-    cwd: workspaceRoot,
-    pty: ptyProcess,
-    collectors: new Set(),
-    queue: Promise.resolve(),
-    recentOutput: "",
-    recentUrls: []
-  };
-
-  ptyProcess.onData((data) => {
-    appendTerminalOutput(record, data);
-    emitTerminalData(id, data);
-    for (const collector of Array.from(record.collectors)) {
-      try {
-        collector(data);
-      } catch {
-        record.collectors.delete(collector);
-      }
-    }
-  });
-
-  ptyProcess.onExit(({ exitCode }) => {
-    terminals.delete(id);
+const terminalManager = createTerminalManager({
+  pty,
+  spawn,
+  randomUUID,
+  getWorkspaceRoot: () => workspaceRoot,
+  emitTerminalData,
+  onTerminalExit: (id, exitCode) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send("terminal:exit", { id, exitCode });
     }
-  });
+  },
+  appendTerminalOutput,
+  loadSettings,
+  evaluatePolicyDecision,
+  audit,
+  agentRuntimeState
+});
 
-  terminals.set(id, record);
-  audit("terminal.create", { id, shell, cwd: workspaceRoot });
-  return { id, shell, cwd: workspaceRoot };
+const terminals = terminalManager.terminals;
+
+function createTerminal(payload = {}) {
+  return terminalManager.createTerminal(payload);
 }
 
 function listTerminals() {
-  return Array.from(terminals.values()).map((terminal) => ({ id: terminal.id }));
+  return terminalManager.listTerminals();
 }
 
 function writeTerminal(id, data) {
-  const terminal = terminals.get(id);
-  if (!terminal) throw new Error("Terminal not found.");
-  terminal.pty.write(data);
+  return terminalManager.writeTerminal(id, data);
 }
 
 function resizeTerminal(id, cols, rows) {
-  const terminal = terminals.get(id);
-  if (!terminal) throw new Error("Terminal not found.");
-  terminal.pty.resize(Math.max(40, cols), Math.max(6, rows));
+  return terminalManager.resizeTerminal(id, cols, rows);
 }
 
 function killTerminal(id) {
-  const terminal = terminals.get(id);
-  if (!terminal) return { ok: true };
-  terminal.pty.kill();
-  terminals.delete(id);
-  audit("terminal.kill", { id });
-  return { ok: true };
-}
-
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function runCommandInTerminal(record, command) {
-  const token = randomUUID().replace(/-/g, "");
-  const startToken = `__LUMEN_START_${token}__`;
-  const exitTokenPattern = new RegExp(`${escapeRegExp(`__LUMEN_EXIT_${token}_`)}(-?\\d+)__`);
-  const shellCommand = process.platform === "win32"
-    ? [
-        "$__lumenCode = 0",
-        `Write-Output '${startToken}'`,
-        "try {",
-        command,
-        "  if (-not $?) {",
-        "    $__lumenCode = if ($LASTEXITCODE -is [int]) { $LASTEXITCODE } else { 1 }",
-        "  } elseif ($LASTEXITCODE -is [int]) {",
-        "    $__lumenCode = $LASTEXITCODE",
-        "  }",
-        "} catch {",
-        "  Write-Error $_",
-        "  $__lumenCode = 1",
-        "}",
-        `Write-Output \"__LUMEN_EXIT_${token}_$__lumenCode__\"`
-      ].join("\r\n")
-    : [`printf '${startToken}\\n'`, command, `printf '__LUMEN_EXIT_${token}_%s__\\n' \"$?\"`].join("\n");
-
-  const previous = record.queue.catch(() => {});
-  const next = previous.then(
-    () =>
-      new Promise((resolve, reject) => {
-        let buffer = "";
-        let started = false;
-        let output = "";
-        let onData = null;
-        const timeout = setTimeout(() => {
-          if (onData) record.collectors.delete(onData);
-          reject(new Error("Terminal command timed out."));
-        }, 10 * 60 * 1000);
-
-        const finish = (code) => {
-          clearTimeout(timeout);
-          if (onData) record.collectors.delete(onData);
-          resolve({
-            code,
-            stdout: output.replace(/\r/g, "").trim(),
-            stderr: ""
-          });
-        };
-
-        onData = (chunk) => {
-          buffer += chunk;
-          if (!started) {
-            const startIndex = buffer.indexOf(startToken);
-            if (startIndex === -1) {
-              buffer = buffer.slice(-4000);
-              return;
-            }
-            started = true;
-            buffer = buffer.slice(startIndex + startToken.length);
-          }
-
-          const match = exitTokenPattern.exec(buffer);
-          if (!match || match.index === undefined) return;
-
-          output += buffer.slice(0, match.index);
-          finish(Number(match[1] || 1));
-        };
-
-        record.collectors.add(onData);
-        record.pty.write(`${shellCommand}\r`);
-      })
-  );
-  record.queue = next.catch(() => {});
-  return next;
-}
-
-function disallowUnsafeCommand(command) {
-  const trimmed = command.trim();
-  if (!trimmed) return;
-  if (trimmed.includes("..\\") || trimmed.includes("../")) {
-    throw new Error("Relative parent paths are blocked for run_cmd.");
-  }
-  if (/\bhttps?:\/\//i.test(trimmed) && !loadSettings().onlineMode) {
-    throw new Error("Command references network resource while Online mode is disabled.");
-  }
+  return terminalManager.killTerminal(id);
 }
 
 async function runCommand(command, options = {}) {
-  disallowUnsafeCommand(command);
-  if (options.source === "agent") {
-    const decision = evaluatePolicyDecision({
-      actionType: "run_cmd",
-      command,
-      preset: options.preset
-    });
-    audit("policy.decision", {
-      actionType: "run_cmd",
-      command,
-      allowed: decision.allowed,
-      requiresApproval: decision.requiresApproval,
-      risk: decision.risk,
-      preset: decision.preset,
-      source: "agent",
-      mode: agentRuntimeState.mode
-    });
-    if (!decision.allowed) {
-      throw new Error(decision.reason);
-    }
-    if (decision.requiresApproval && !options.approved) {
-      throw new Error("run_cmd requires explicit approval by policy.");
-    }
-  }
-  audit("agent.run_cmd", { command, terminalId: options.terminalId || "" });
-
-  if (options.terminalId) {
-    const record = terminals.get(options.terminalId);
-    if (!record) {
-      throw new Error("Target terminal not found.");
-    }
-    emitTerminalData(options.terminalId, `\r\n> ${command}\r\n`);
-    return runCommandInTerminal(record, command);
-  }
-
-  const shell = process.platform === "win32" ? "powershell.exe" : process.env.SHELL || "bash";
-  const args = process.platform === "win32"
-    ? ["-NoLogo", "-NoProfile", "-Command", `Set-Location -LiteralPath '${workspaceRoot.replace(/'/g, "''")}'; ${command}`]
-    : ["-lc", `cd '${workspaceRoot.replace(/'/g, "\\'")}'; ${command}`];
-
-  return await new Promise((resolve) => {
-    const child = spawn(shell, args, {
-      cwd: workspaceRoot,
-      env: process.env
-    });
-
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-    });
-
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    child.on("close", (code) => {
-      resolve({
-        code: code ?? 0,
-        stdout: stdout.slice(-24000),
-        stderr: stderr.slice(-12000)
-      });
-    });
-  });
+  return terminalManager.runCommand(command, options);
 }
 
 async function getGit() {
@@ -3005,184 +2992,98 @@ async function createWindow() {
   } else {
     await mainWindow.loadFile(path.join(APP_ROOT, "dist", "index.html"));
   }
+
+  mainWindow.on("focus", () => {
+    workspaceWindowActive = true;
+    syncWorkspaceWatcher("window_focus");
+  });
+
+  mainWindow.on("blur", () => {
+    workspaceWindowActive = false;
+    syncWorkspaceWatcher("window_blur");
+  });
 }
 
-ipcMain.handle("workspace:getRoot", async () => ({ root: workspaceRoot }));
-ipcMain.handle("workspace:openFolder", async () => {
-  const result = await dialog.showOpenDialog({
-    properties: ["openDirectory"],
-    title: "Select workspace folder"
-  });
-
-  if (result.canceled || !result.filePaths?.length) return { cancelled: true, root: workspaceRoot };
-
-  workspaceRoot = path.resolve(result.filePaths[0]);
-  saveWorkspaceRoot(workspaceRoot);
-  await stopPreview("workspace_changed");
-  audit("workspace.open", { root: workspaceRoot });
-
-  for (const terminalId of Array.from(terminals.keys())) {
-    killTerminal(terminalId);
-  }
-
-  return { cancelled: false, root: workspaceRoot };
-});
-
-ipcMain.handle("files:list", async (_event, payload) => {
-  return listDir(payload?.path);
-});
-ipcMain.handle("files:read", async (_event, payload) => readFile(payload.path));
-ipcMain.handle("files:write", async (_event, payload) => writeFile(payload.path, payload.content, payload));
-ipcMain.handle("files:create", async (_event, payload) => createFile(payload.path));
-ipcMain.handle("files:mkdir", async (_event, payload) => createDirectory(payload.path));
-ipcMain.handle("files:rename", async (_event, payload) => renamePath(payload.path, payload.nextPath));
-ipcMain.handle("files:delete", async (_event, payload) => deletePath(payload.path, payload));
-ipcMain.handle("files:search", async (_event, payload) => ({ results: searchFiles(payload.query, payload.maxResults) }));
-ipcMain.handle("workspace:inspect", async (_event, payload) => inspectProject(payload || {}));
-
-ipcMain.handle("terminal:create", async (_event, payload) => createTerminal(payload || {}));
-ipcMain.handle("terminal:list", async () => ({ terminals: listTerminals() }));
-ipcMain.handle("terminal:write", async (_event, payload) => {
-  writeTerminal(payload.id, payload.data);
-  return { ok: true };
-});
-ipcMain.handle("terminal:resize", async (_event, payload) => {
-  resizeTerminal(payload.id, payload.cols, payload.rows);
-  return { ok: true };
-});
-ipcMain.handle("terminal:kill", async (_event, payload) => killTerminal(payload.id));
-
-ipcMain.handle("settings:load", async () => loadSettings());
-ipcMain.handle("settings:save", async (_event, payload) => saveSettings(payload));
-ipcMain.handle("policy:get", async () => getPolicyState());
-ipcMain.handle("policy:setPreset", async (_event, payload) => setPolicyPreset(payload?.preset));
-ipcMain.handle("policy:evaluate", async (_event, payload) => {
-  const decision = evaluatePolicyDecision(payload || {});
-  audit("policy.evaluate", {
-    actionType: payload?.actionType || "",
-    allowed: decision.allowed,
-    requiresApproval: decision.requiresApproval,
-    risk: decision.risk,
-    preset: decision.preset,
-    mode: agentRuntimeState.mode
-  });
-  return decision;
-});
-
-ipcMain.handle("llm:test", async (_event, payload) => testLlmConnection(payload));
-ipcMain.handle("llm:listModels", async (_event, payload) => listLlmModels(payload));
-ipcMain.handle("llm:installModel", async (_event, payload) => installLlmModel(payload));
-ipcMain.handle("llm:startStream", async (event, payload) => {
-  startLlmStream(event, payload);
-  return { ok: true };
-});
-ipcMain.handle("llm:abortStream", async (_event, payload) => stopLlmStream(payload.requestId));
-
-ipcMain.handle("agent:setMode", async (_event, payload) => {
-  const nextMode = String(payload?.mode || "").trim() === "live_build" ? "live_build" : "manual";
-  agentRuntimeState.mode = nextMode;
-  if (Array.isArray(payload?.taskGraph)) {
-    agentRuntimeState.taskGraph = payload.taskGraph;
-  }
-  audit("agent.mode", { mode: agentRuntimeState.mode });
-  return { mode: agentRuntimeState.mode };
-});
-ipcMain.handle("agent:getTaskGraph", async () => ({
-  mode: agentRuntimeState.mode,
-  taskGraph: agentRuntimeState.taskGraph
-}));
-ipcMain.handle("agent:runCmd", async (_event, payload) =>
-  runCommand(payload.command, {
-    terminalId: payload?.terminalId || "",
-    approved: Boolean(payload?.approved),
-    source: payload?.source || "agent",
-    preset: payload?.preset || ""
-  })
-);
-ipcMain.handle("preview:status", async () => getPreviewStatus());
-ipcMain.handle("preview:start", async (_event, payload) => {
-  const normalized = payload || {};
-  enforceAgentPolicy(normalized, "preview_start", normalized.command || "");
-  return startPreviewServer(normalized);
-});
-ipcMain.handle("preview:startProject", async (_event, payload) => {
-  const normalized = payload || {};
-  enforceAgentPolicy(normalized, "preview_start", normalized.command || "");
-  return startPreviewProject(normalized);
-});
-ipcMain.handle("preview:stop", async () => stopPreview("manual"));
-ipcMain.handle("preview:browserConnect", async (_event, payload) => {
-  const normalized = payload || {};
-  enforceAgentPolicy(normalized, "preview_snapshot");
-  return connectPreviewBrowser(normalized.url || "");
-});
-ipcMain.handle("preview:browserSnapshot", async (_event, payload) => {
-  const normalized = payload || {};
-  enforceAgentPolicy(normalized, "preview_snapshot");
-  return snapshotPreviewBrowser();
-});
-ipcMain.handle("preview:browserDiagnostics", async (_event, payload) => {
-  const normalized = payload || {};
-  enforceAgentPolicy(normalized, "preview_snapshot");
-  return getPreviewBrowserDiagnostics(normalized);
-});
-ipcMain.handle("preview:browserScreenshot", async (_event, payload) => {
-  const normalized = payload || {};
-  enforceAgentPolicy(normalized, "preview_screenshot");
-  return screenshotPreviewBrowser(normalized);
-});
-ipcMain.handle("preview:browserClick", async (_event, payload) => {
-  const normalized = payload || {};
-  enforceAgentPolicy(normalized, "preview_click");
-  return clickPreviewBrowser(normalized);
-});
-ipcMain.handle("preview:browserType", async (_event, payload) => {
-  const normalized = payload || {};
-  enforceAgentPolicy(normalized, "preview_type");
-  return typePreviewBrowser(normalized);
-});
-ipcMain.handle("preview:browserPress", async (_event, payload) => {
-  const normalized = payload || {};
-  enforceAgentPolicy(normalized, "preview_press");
-  return pressPreviewBrowser(normalized);
-});
-ipcMain.handle("preview:browserPick", async (_event, payload) => {
-  const normalized = payload || {};
-  enforceAgentPolicy(normalized, "preview_click");
-  return pickPreviewBrowserSelector(normalized);
-});
-ipcMain.handle("preview:browserClose", async () => closePreviewBrowser("manual"));
-ipcMain.handle("runtime:setLowResourceMode", async (_event, payload) => setLowResourceMode(Boolean(payload?.enabled)));
-ipcMain.handle("runtime:getHealth", async () => getRuntimeHealth());
-
-ipcMain.handle("git:status", async () => gitStatus());
-ipcMain.handle("git:diff", async (_event, payload) => gitDiff(payload?.path || "", Boolean(payload?.staged)));
-ipcMain.handle("git:stage", async (_event, payload) => gitStage(payload.paths));
-ipcMain.handle("git:unstage", async (_event, payload) => gitUnstage(payload.paths));
-ipcMain.handle("git:commit", async (_event, payload) => gitCommit(payload.message, { approved: Boolean(payload?.approved ?? true) }));
-ipcMain.handle("git:push", async (_event, payload) => gitPush({ approved: Boolean(payload?.approved ?? true) }));
-ipcMain.handle("git:merge", async (_event, payload) => gitMerge({ ...(payload || {}), approved: Boolean(payload?.approved ?? true) }));
-ipcMain.handle("git:rebase", async (_event, payload) => gitRebase({ ...(payload || {}), approved: Boolean(payload?.approved ?? true) }));
-ipcMain.handle("git:cherryPick", async (_event, payload) =>
-  gitCherryPick({ ...(payload || {}), approved: Boolean(payload?.approved ?? true) })
-);
-ipcMain.handle("git:branches", async () => gitBranches());
-ipcMain.handle("git:checkout", async (_event, payload) => gitCheckoutBranch(payload || {}));
-ipcMain.handle("git:history", async (_event, payload) => gitHistory(payload?.limit));
-ipcMain.handle("git:restore", async (_event, payload) => gitRestore(payload?.paths || [], payload || {}));
-ipcMain.handle("git:conflicts", async () => gitConflicts());
-ipcMain.handle("git:resolveConflict", async (_event, payload) => gitResolveConflict(payload || {}));
-
-ipcMain.handle("audit:list", async () => ({ entries: loadAudit() }));
-ipcMain.handle("audit:clear", async () => {
-  const auditPath = getUserDataPath(AUDIT_FILE);
-  if (fs.existsSync(auditPath)) fs.rmSync(auditPath, { force: true });
-  audit("audit.clear", {});
-  return { ok: true };
+registerIpcHandlers({
+  ipcMain,
+  dialog,
+  fs,
+  path,
+  getWorkspaceRoot: () => workspaceRoot,
+  setWorkspaceRoot: (nextRoot) => {
+    workspaceRoot = nextRoot;
+  },
+  saveWorkspaceRoot,
+  stopPreview,
+  syncWorkspaceWatcher,
+  scheduleWorkspaceIndex,
+  audit,
+  terminals,
+  killTerminal,
+  listDir,
+  readFile,
+  writeFile,
+  createFile,
+  createDirectory,
+  renamePath,
+  deletePath,
+  searchFiles,
+  inspectProject,
+  createTerminal,
+  listTerminals,
+  writeTerminal,
+  resizeTerminal,
+  loadSettings,
+  saveSettings,
+  getPolicyState,
+  setPolicyPreset,
+  evaluatePolicyDecision,
+  agentRuntimeState,
+  testLlmConnection,
+  listLlmModels,
+  installLlmModel,
+  startLlmStream,
+  stopLlmStream,
+  runCommand,
+  getPreviewStatus,
+  enforceAgentPolicy,
+  startPreviewServer,
+  startPreviewProject,
+  connectPreviewBrowser,
+  snapshotPreviewBrowser,
+  getPreviewBrowserDiagnostics,
+  screenshotPreviewBrowser,
+  clickPreviewBrowser,
+  typePreviewBrowser,
+  pressPreviewBrowser,
+  pickPreviewBrowserSelector,
+  closePreviewBrowser,
+  setLowResourceMode,
+  getRuntimeHealth,
+  gitStatus,
+  gitDiff,
+  gitStage,
+  gitUnstage,
+  gitCommit,
+  gitPush,
+  gitMerge,
+  gitRebase,
+  gitCherryPick,
+  gitBranches,
+  gitCheckoutBranch,
+  gitHistory,
+  gitRestore,
+  gitConflicts,
+  gitResolveConflict,
+  loadAudit,
+  getUserDataPath,
+  AUDIT_FILE
 });
 
 app.whenReady().then(async () => {
   loadWorkspaceRoot();
+  syncWorkspaceWatcher("app_ready");
+  scheduleWorkspaceIndex("app_ready");
   await createWindow();
 
   app.on("activate", async () => {
@@ -3194,6 +3095,11 @@ app.whenReady().then(async () => {
 
 app.on("window-all-closed", () => {
   void stopPreview("app_exit");
+  stopWorkspaceWatcher("app_exit");
+  if (workspaceIndexTimer) {
+    clearTimeout(workspaceIndexTimer);
+    workspaceIndexTimer = null;
+  }
   for (const terminalId of Array.from(terminals.keys())) {
     killTerminal(terminalId);
   }

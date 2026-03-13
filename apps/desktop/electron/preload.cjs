@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld("lumen", {
   workspace: {
     getRoot: () => ipcRenderer.invoke("workspace:getRoot"),
     openFolder: () => ipcRenderer.invoke("workspace:openFolder"),
+    setRoot: (payload) => ipcRenderer.invoke("workspace:setRoot", payload),
     list: (payload) => ipcRenderer.invoke("files:list", payload),
     read: (payload) => ipcRenderer.invoke("files:read", payload),
     write: (payload) => ipcRenderer.invoke("files:write", payload),

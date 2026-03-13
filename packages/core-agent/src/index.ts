@@ -136,6 +136,24 @@ export type AgentLoopResult = {
   verifyResult: ToolExecutionResult | null;
 };
 
+export type RecoveryPolicy =
+  | "retry_same_command"
+  | "inspect_scripts"
+  | "inspect_port_conflict"
+  | "install_dependencies"
+  | "localize_compile_error"
+  | "rollback_patch";
+
+export type RecoverySuggestion = {
+  policy: RecoveryPolicy;
+  reason: string;
+  confidence: ActionRisk;
+  blocker: string;
+  action?: AgentAction;
+  filePath?: string;
+  line?: number;
+};
+
 export const POLICY_PRESETS: PermissionPreset[] = [
   "read_only",
   "local_edit_only",
@@ -287,6 +305,170 @@ export function buildPlan(goal: string, actions: AgentAction[]): string[] {
     "PROPOSE: show diff preview for any pending file changes",
     "APPLY: only after explicit approval"
   ];
+}
+
+function phaseForAction(action: AgentAction): AgentPhase {
+  if (action.type === "list_dir" || action.type === "read_file" || action.type === "search_files" || action.type === "git_status") {
+    return "scope";
+  }
+  if (action.type === "preview_status" || action.type === "preview_snapshot" || action.type === "preview_screenshot") {
+    return "verify";
+  }
+  if (action.type === "write_file" || action.type === "delete_file") {
+    return "propose";
+  }
+  return "execute";
+}
+
+function labelForAction(action: AgentAction): string {
+  if (action.path) return `${action.type} · ${action.path.split(/[\\/]/).pop() || action.path}`;
+  if (action.command) return `${action.type} · ${action.command}`;
+  if (action.query) return `${action.type} · ${action.query}`;
+  if (action.selector) return `${action.type} · ${action.selector}`;
+  return action.type;
+}
+
+export function buildTaskGraph(goal: string, actions: AgentAction[]): TaskNode[] {
+  const baseNodes = actions.map((action, index) => ({
+    id: `${index + 1}`,
+    title: labelForAction(action),
+    phase: phaseForAction(action),
+    status: "pending" as TaskStatus,
+    confidence: riskForAction(action),
+    dependsOn: index > 0 ? [`${index}`] : [],
+    detail: action.reason || goal
+  }));
+
+  if (!actions.some((action) => action.type === "write_file" || action.type === "delete_file")) {
+    return baseNodes;
+  }
+
+  const lastId = baseNodes.length ? baseNodes[baseNodes.length - 1].id : "0";
+  const verifyId = `${baseNodes.length + 1}`;
+  const proposeId = `${baseNodes.length + 2}`;
+  const applyId = `${baseNodes.length + 3}`;
+
+  return [
+    ...baseNodes,
+    {
+      id: verifyId,
+      title: "Run verification command(s)",
+      phase: "verify",
+      status: "pending",
+      confidence: "likely",
+      dependsOn: [lastId],
+      detail: "Validate proposed changes before apply."
+    },
+    {
+      id: proposeId,
+      title: "Review diff proposal",
+      phase: "propose",
+      status: "pending",
+      confidence: "likely",
+      dependsOn: [verifyId],
+      detail: "Confirm file/hunk selection."
+    },
+    {
+      id: applyId,
+      title: "Apply approved changes",
+      phase: "apply",
+      status: "pending",
+      confidence: "uncertain",
+      dependsOn: [proposeId],
+      detail: "Write only after explicit approval."
+    }
+  ];
+}
+
+function normalizeFailureText(errorText: string, outputText: string): string {
+  return `${String(errorText || "")}\n${String(outputText || "")}`.trim().toLowerCase();
+}
+
+function extractCompileLocation(rawText: string): { filePath: string; line: number } | null {
+  const match = String(rawText || "").match(
+    /([A-Za-z]:\\[^:\n\r]+|\.[\\/][^:\n\r]+|\b[\w./\\-]+\.(?:ts|tsx|js|jsx|py|rs|go|java)):(\d+)(?::(\d+))?/
+  );
+  if (!match?.[1]) return null;
+  return { filePath: match[1], line: Number(match[2] || 0) };
+}
+
+export function deriveRecoverySuggestions(input: {
+  failedAction: AgentAction;
+  error?: string;
+  output?: unknown;
+  hasPendingChanges?: boolean;
+  recoveryAttempt?: number;
+}): RecoverySuggestion[] {
+  const suggestions: RecoverySuggestion[] = [];
+  const raw = `${input.error || ""}\n${String(input.output || "")}`.trim();
+  const failure = normalizeFailureText(input.error || "", String(input.output || ""));
+
+  if (input.failedAction.type === "run_cmd" && input.failedAction.command) {
+    suggestions.push({
+      policy: "retry_same_command",
+      reason: "Retry once to rule out transient shell/tool failures.",
+      confidence: "likely",
+      blocker: "Command execution instability",
+      action: { type: "run_cmd", command: input.failedAction.command, reason: "Recovery retry command" }
+    });
+  }
+
+  if (failure.includes("no runnable project script") || failure.includes("missing script")) {
+    suggestions.push({
+      policy: "inspect_scripts",
+      reason: "Inspect package scripts and pick a runnable dev command.",
+      confidence: "likely",
+      blocker: "Missing/incorrect project script",
+      action: { type: "read_file", path: "package.json", reason: "Recovery inspect scripts" }
+    });
+  }
+
+  if (failure.includes("eaddrinuse") || failure.includes("address already in use")) {
+    suggestions.push({
+      policy: "inspect_port_conflict",
+      reason: "Check listening ports before restarting preview.",
+      confidence: "likely",
+      blocker: "Port conflict",
+      action: {
+        type: "run_cmd",
+        command: "netstat -ano | findstr LISTENING",
+        reason: "Recovery inspect listening ports"
+      }
+    });
+  }
+
+  if (failure.includes("cannot find module") || failure.includes("command not found") || failure.includes("is not recognized")) {
+    suggestions.push({
+      policy: "install_dependencies",
+      reason: "Install missing dependencies or binaries before rerun.",
+      confidence: "uncertain",
+      blocker: "Missing dependency/toolchain",
+      action: { type: "run_cmd", command: "pnpm install", reason: "Recovery install dependencies" }
+    });
+  }
+
+  const compileLocation = extractCompileLocation(raw);
+  if (compileLocation) {
+    suggestions.push({
+      policy: "localize_compile_error",
+      reason: "Localize compile error by opening file context.",
+      confidence: "likely",
+      blocker: "Compile/runtime error location",
+      filePath: compileLocation.filePath,
+      line: compileLocation.line
+    });
+  }
+
+  if (input.hasPendingChanges && (input.recoveryAttempt || 0) >= 2) {
+    suggestions.push({
+      policy: "rollback_patch",
+      reason: "Repeated failures with pending edits; rollback last patch set.",
+      confidence: "risky",
+      blocker: "Potential bad patch state"
+    });
+  }
+
+  return suggestions;
 }
 
 export function permissionForAction(action: AgentAction): PermissionRequirement {
