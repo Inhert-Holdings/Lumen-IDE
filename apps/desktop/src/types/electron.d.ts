@@ -23,6 +23,26 @@ export type LlmSettings = {
   autoStopMinutes: number;
   recentModels: string[];
   helperRecentModels: string[];
+  lowResourceMode: boolean;
+  permissionPreset:
+    | "read_only"
+    | "local_edit_only"
+    | "local_build_mode"
+    | "preview_operator"
+    | "git_operator"
+    | "full_local_workspace"
+    | "trusted_workspace_profile";
+};
+
+export type ActionRisk = "obvious" | "likely" | "uncertain" | "risky";
+
+export type PolicyDecision = {
+  preset: LlmSettings["permissionPreset"];
+  actionType: string;
+  risk: ActionRisk;
+  allowed: boolean;
+  requiresApproval: boolean;
+  reason: string;
 };
 
 export type AuditEntry = {
@@ -78,6 +98,55 @@ export type PreviewSnapshot = {
   text: string;
 };
 
+export type PreviewScreenshot = {
+  path: string;
+  url: string;
+  title: string;
+};
+
+export type PreviewPickedSelector = {
+  selector: string;
+  tag: string;
+  text: string;
+  x: number;
+  y: number;
+  ratioX: number;
+  ratioY: number;
+};
+
+export type PreviewBrowserDiagnostics = {
+  url: string;
+  title: string;
+  consoleEvents: Array<{
+    type: string;
+    text: string;
+    location?: { url?: string; lineNumber?: number; columnNumber?: number } | null;
+    at: string;
+  }>;
+  networkEvents: Array<{
+    type: string;
+    url: string;
+    method: string;
+    status: number;
+    ok: boolean;
+    error?: string;
+    at: string;
+  }>;
+  domSummary: null | {
+    url: string;
+    title: string;
+    headings: string[];
+    counts: {
+      links: number;
+      buttons: number;
+      inputs: number;
+      forms: number;
+      interactive: number;
+    };
+    textSample: string;
+  };
+};
+
 declare global {
   interface Window {
     lumen: {
@@ -86,11 +155,22 @@ declare global {
         openFolder: () => Promise<{ cancelled: boolean; root: string }>;
         list: (payload?: { path?: string }) => Promise<{ root: string; tree: WorkspaceNode }>;
         read: (payload: { path: string }) => Promise<{ path: string; content: string }>;
-        write: (payload: { path: string; content: string }) => Promise<{ ok: boolean }>;
+        write: (payload: {
+          path: string;
+          content: string;
+          approved?: boolean;
+          source?: "user" | "agent_apply";
+          preset?: LlmSettings["permissionPreset"];
+        }) => Promise<{ ok: boolean }>;
         create: (payload: { path: string }) => Promise<{ ok: boolean }>;
         mkdir: (payload: { path: string }) => Promise<{ ok: boolean }>;
         rename: (payload: { path: string; nextPath: string }) => Promise<{ ok: boolean }>;
-        delete: (payload: { path: string }) => Promise<{ ok: boolean }>;
+        delete: (payload: {
+          path: string;
+          approved?: boolean;
+          source?: "user" | "agent_apply";
+          preset?: LlmSettings["permissionPreset"];
+        }) => Promise<{ ok: boolean }>;
         search: (payload: { query: string; maxResults?: number }) => Promise<{ results: Array<{ path: string; line: number; preview: string }> }>;
         inspect: (payload?: { path?: string }) => Promise<ProjectInspection>;
       };
@@ -112,8 +192,45 @@ declare global {
         diff: (payload: { path?: string; staged?: boolean }) => Promise<{ isRepo: boolean; diff: string }>;
         stage: (payload: { paths: string[] }) => Promise<{ ok: boolean }>;
         unstage: (payload: { paths: string[] }) => Promise<{ ok: boolean }>;
-        commit: (payload: { message: string }) => Promise<{ ok: boolean; hash: string }>;
-        push: () => Promise<{ ok: boolean }>;
+        commit: (payload: { message: string; approved?: boolean }) => Promise<{ ok: boolean; hash: string }>;
+        push: (payload?: { approved?: boolean }) => Promise<{ ok: boolean }>;
+        merge: (payload: { branch: string; approved?: boolean }) => Promise<{
+          ok: boolean;
+          branch: string;
+          summary: { changes: number; insertions: number; deletions: number } | null;
+        }>;
+        rebase: (payload: { upstream: string; approved?: boolean }) => Promise<{
+          ok: boolean;
+          upstream: string;
+          output: string;
+        }>;
+        cherryPick: (payload: { commit: string; approved?: boolean }) => Promise<{
+          ok: boolean;
+          commit: string;
+          output: string;
+        }>;
+        branches: () => Promise<{
+          isRepo: boolean;
+          current: string;
+          branches: Array<{ name: string; current: boolean; remote: boolean }>;
+        }>;
+        checkout: (payload: { name: string; create?: boolean }) => Promise<{ ok: boolean; current: string }>;
+        history: (payload?: { limit?: number }) => Promise<{
+          isRepo: boolean;
+          commits: Array<{ hash: string; shortHash: string; message: string; author: string; date: string }>;
+        }>;
+        restore: (payload: { paths: string[]; staged?: boolean; workingTree?: boolean }) => Promise<{ ok: boolean }>;
+        conflicts: () => Promise<{ isRepo: boolean; hasConflicts: boolean; files: string[]; hints: string[] }>;
+        resolveConflict: (payload: { path: string; strategy: "ours" | "theirs" }) => Promise<{
+          ok: boolean;
+          path: string;
+          strategy: "ours" | "theirs";
+        }>;
+      };
+      policy: {
+        get: () => Promise<{ preset: LlmSettings["permissionPreset"]; presets: LlmSettings["permissionPreset"][] }>;
+        setPreset: (payload: { preset: LlmSettings["permissionPreset"] }) => Promise<{ preset: LlmSettings["permissionPreset"]; presets: LlmSettings["permissionPreset"][] }>;
+        evaluate: (payload: { actionType: string; command?: string; preset?: LlmSettings["permissionPreset"] }) => Promise<PolicyDecision>;
       };
       settings: {
         load: () => Promise<LlmSettings>;
@@ -143,11 +260,27 @@ declare global {
         onStatus: (listener: (payload: { requestId: string; message: string; modelUsed?: string }) => void) => () => void;
       };
       agent: {
-        runCmd: (payload: { command: string; terminalId?: string }) => Promise<{ code: number; stdout: string; stderr: string }>;
+        runCmd: (payload: {
+          command: string;
+          terminalId?: string;
+          approved?: boolean;
+          source?: "agent" | "system";
+          preset?: LlmSettings["permissionPreset"];
+        }) => Promise<{ code: number; stdout: string; stderr: string }>;
+        setMode: (payload: { mode: "manual" | "live_build"; taskGraph?: unknown[] }) => Promise<{ mode: "manual" | "live_build" }>;
+        getTaskGraph: () => Promise<{ mode: "manual" | "live_build"; taskGraph: unknown[] }>;
       };
       preview: {
         status: () => Promise<PreviewStatus>;
-        start: (payload?: { path?: string; entry?: string; port?: number }) => Promise<{
+        start: (payload?: {
+          path?: string;
+          entry?: string;
+          port?: number;
+          approved?: boolean;
+          source?: "user" | "agent";
+          preset?: LlmSettings["permissionPreset"];
+          command?: string;
+        }) => Promise<{
           running: boolean;
           mode: "idle" | "static" | "project";
           url: string;
@@ -171,20 +304,95 @@ declare global {
             lastNetworkError: string;
           };
         }>;
-        startProject: (payload?: { path?: string; command?: string; url?: string; port?: number; terminalId?: string }) => Promise<PreviewStatus>;
+        startProject: (payload?: {
+          path?: string;
+          command?: string;
+          url?: string;
+          port?: number;
+          terminalId?: string;
+          approved?: boolean;
+          source?: "user" | "agent";
+          preset?: LlmSettings["permissionPreset"];
+        }) => Promise<PreviewStatus>;
         stop: () => Promise<{ ok: boolean } & PreviewStatus>;
-        browserConnect: (payload?: { url?: string }) => Promise<{
+        browserConnect: (payload?: {
+          url?: string;
+          approved?: boolean;
+          source?: "user" | "agent";
+          preset?: LlmSettings["permissionPreset"];
+        }) => Promise<{
           connected: boolean;
           url: string;
           title: string;
           executable: string;
           snapshot: PreviewSnapshot;
         }>;
-        browserSnapshot: () => Promise<PreviewSnapshot>;
-        browserClick: (payload: { selector: string; url?: string }) => Promise<PreviewSnapshot>;
-        browserType: (payload: { selector: string; text: string; url?: string }) => Promise<PreviewSnapshot>;
-        browserPress: (payload: { key: string; url?: string }) => Promise<PreviewSnapshot>;
+        browserSnapshot: (payload?: {
+          approved?: boolean;
+          source?: "user" | "agent";
+          preset?: LlmSettings["permissionPreset"];
+        }) => Promise<PreviewSnapshot>;
+        browserDiagnostics: (payload?: {
+          url?: string;
+          limit?: number;
+          includeDom?: boolean;
+          approved?: boolean;
+          source?: "user" | "agent";
+          preset?: LlmSettings["permissionPreset"];
+        }) => Promise<PreviewBrowserDiagnostics>;
+        browserScreenshot: (payload?: {
+          url?: string;
+          fileName?: string;
+          fullPage?: boolean;
+          approved?: boolean;
+          source?: "user" | "agent";
+          preset?: LlmSettings["permissionPreset"];
+        }) => Promise<PreviewScreenshot>;
+        browserClick: (payload: {
+          selector: string;
+          url?: string;
+          approved?: boolean;
+          source?: "user" | "agent";
+          preset?: LlmSettings["permissionPreset"];
+        }) => Promise<PreviewSnapshot>;
+        browserType: (payload: {
+          selector: string;
+          text: string;
+          url?: string;
+          approved?: boolean;
+          source?: "user" | "agent";
+          preset?: LlmSettings["permissionPreset"];
+        }) => Promise<PreviewSnapshot>;
+        browserPress: (payload: {
+          key: string;
+          url?: string;
+          approved?: boolean;
+          source?: "user" | "agent";
+          preset?: LlmSettings["permissionPreset"];
+        }) => Promise<PreviewSnapshot>;
+        browserPick: (payload: {
+          ratioX: number;
+          ratioY: number;
+          url?: string;
+          approved?: boolean;
+          source?: "user" | "agent";
+          preset?: LlmSettings["permissionPreset"];
+        }) => Promise<PreviewPickedSelector>;
         browserClose: () => Promise<{ connected: boolean; url: string; title: string; executable: string }>;
+      };
+      runtime: {
+        setLowResourceMode: (payload: { enabled: boolean }) => Promise<{
+          lowResourceMode: boolean;
+          managedRuntime: { active: boolean; name: string; modelsPath: string };
+          preview: { staticRunning: boolean; projectRunning: boolean; browserConnected: boolean };
+          process: { pid: number; uptimeSec: number; memoryRss: number };
+        }>;
+        getHealth: () => Promise<{
+          lowResourceMode: boolean;
+          managedRuntime: { active: boolean; name: string; modelsPath: string };
+          preview: { staticRunning: boolean; projectRunning: boolean; browserConnected: boolean };
+          process: { pid: number; uptimeSec: number; memoryRss: number };
+        }>;
       };
       audit: {
         list: () => Promise<{ entries: AuditEntry[] }>;

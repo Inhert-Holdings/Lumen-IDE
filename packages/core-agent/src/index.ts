@@ -10,6 +10,7 @@ export type ActionType =
   | "preview_start"
   | "preview_status"
   | "preview_snapshot"
+  | "preview_screenshot"
   | "preview_click"
   | "preview_type"
   | "preview_press"
@@ -17,8 +18,56 @@ export type ActionType =
   | "git_diff"
   | "git_stage"
   | "git_unstage"
+  | "git_merge"
+  | "git_rebase"
+  | "git_cherry_pick"
   | "git_commit"
   | "git_push";
+
+export type ActionRisk = "obvious" | "likely" | "uncertain" | "risky";
+
+export type PermissionPreset =
+  | "read_only"
+  | "local_edit_only"
+  | "local_build_mode"
+  | "preview_operator"
+  | "git_operator"
+  | "full_local_workspace"
+  | "trusted_workspace_profile";
+
+export type PolicyDecision = {
+  preset: PermissionPreset;
+  actionType: ActionType;
+  risk: ActionRisk;
+  allowed: boolean;
+  requiresApproval: boolean;
+  reason: string;
+};
+
+export type AgentMode = "manual" | "live_build";
+
+export type AgentPhase =
+  | "understand"
+  | "scope"
+  | "plan"
+  | "execute"
+  | "verify"
+  | "recover"
+  | "propose"
+  | "apply"
+  | "summarize";
+
+export type TaskStatus = "pending" | "running" | "done" | "failed" | "blocked";
+
+export type TaskNode = {
+  id: string;
+  title: string;
+  phase: AgentPhase;
+  status: TaskStatus;
+  confidence: ActionRisk;
+  dependsOn: string[];
+  detail?: string;
+};
 
 export type AgentAction = {
   type: ActionType;
@@ -28,6 +77,9 @@ export type AgentAction = {
   content?: string;
   command?: string;
   message?: string;
+  branch?: string;
+  upstream?: string;
+  commit?: string;
   paths?: string[];
   staged?: boolean;
   entry?: string;
@@ -84,6 +136,141 @@ export type AgentLoopResult = {
   verifyResult: ToolExecutionResult | null;
 };
 
+export const POLICY_PRESETS: PermissionPreset[] = [
+  "read_only",
+  "local_edit_only",
+  "local_build_mode",
+  "preview_operator",
+  "git_operator",
+  "full_local_workspace",
+  "trusted_workspace_profile"
+];
+
+export function riskForAction(action: AgentAction): ActionRisk {
+  if (
+    action.type === "git_push" ||
+    action.type === "git_commit" ||
+    action.type === "git_merge" ||
+    action.type === "git_rebase" ||
+    action.type === "git_cherry_pick"
+  ) {
+    return "risky";
+  }
+  if (action.type === "delete_file" || action.type === "write_file") return "uncertain";
+  if (action.type === "run_cmd") {
+    return isReadOnlyCommand(action.command || "") ? "likely" : "risky";
+  }
+  if (
+    action.type === "preview_click" ||
+    action.type === "preview_type" ||
+    action.type === "preview_press" ||
+    action.type === "preview_screenshot"
+  ) {
+    return "likely";
+  }
+  if (action.type === "preview_start") return "likely";
+  return "obvious";
+}
+
+function presetAllowsAction(preset: PermissionPreset, action: AgentAction): boolean {
+  const readActions: ActionType[] = [
+    "list_dir",
+    "read_file",
+    "search_files",
+    "git_status",
+    "git_diff",
+    "preview_status",
+    "preview_snapshot",
+    "preview_screenshot"
+  ];
+  const editActions: ActionType[] = ["write_file", "delete_file"];
+  const previewActions: ActionType[] = ["preview_start", "preview_click", "preview_type", "preview_press"];
+  const gitActions: ActionType[] = [
+    "git_stage",
+    "git_unstage",
+    "git_merge",
+    "git_rebase",
+    "git_cherry_pick",
+    "git_commit",
+    "git_push"
+  ];
+
+  if (preset === "read_only") {
+    return readActions.includes(action.type);
+  }
+  if (preset === "local_edit_only") {
+    return readActions.includes(action.type) || editActions.includes(action.type);
+  }
+  if (preset === "preview_operator") {
+    return readActions.includes(action.type) || previewActions.includes(action.type);
+  }
+  if (preset === "git_operator") {
+    return readActions.includes(action.type) || gitActions.includes(action.type);
+  }
+  if (preset === "local_build_mode") {
+    return (
+      readActions.includes(action.type) ||
+      editActions.includes(action.type) ||
+      previewActions.includes(action.type) ||
+      action.type === "run_cmd" ||
+      action.type === "git_stage" ||
+      action.type === "git_unstage"
+    );
+  }
+  if (preset === "full_local_workspace") {
+    return true;
+  }
+  if (preset === "trusted_workspace_profile") {
+    return true;
+  }
+  return false;
+}
+
+export function evaluatePolicyDecision(
+  action: AgentAction,
+  preset: PermissionPreset,
+  onlineMode: boolean
+): PolicyDecision {
+  const risk = riskForAction(action);
+  if (action.type === "git_push" && !onlineMode) {
+    return {
+      preset,
+      actionType: action.type,
+      risk,
+      allowed: false,
+      requiresApproval: false,
+      reason: "Online mode is disabled."
+    };
+  }
+
+  const allowed = presetAllowsAction(preset, action);
+  if (!allowed) {
+    return {
+      preset,
+      actionType: action.type,
+      risk,
+      allowed: false,
+      requiresApproval: false,
+      reason: `Action ${action.type} is blocked by ${preset} preset.`
+    };
+  }
+
+  const baseline = permissionForAction(action).approvalRequired;
+  const requiresApproval =
+    preset === "trusted_workspace_profile"
+      ? risk === "risky"
+      : baseline || risk === "uncertain" || risk === "risky";
+
+  return {
+    preset,
+    actionType: action.type,
+    risk,
+    allowed: true,
+    requiresApproval,
+    reason: requiresApproval ? `Requires approval (${risk} risk).` : `Allowed (${risk} risk).`
+  };
+}
+
 export function redactSecrets(text: string): string {
   return text
     .replace(/sk-[A-Za-z0-9_-]{10,}/g, "[REDACTED_KEY]")
@@ -127,6 +314,15 @@ export function permissionForAction(action: AgentAction): PermissionRequirement 
   }
   if (action.type === "git_commit") {
     return { approvalRequired: true, onlineRequired: false, reason: "git_commit requires approval" };
+  }
+  if (action.type === "git_merge") {
+    return { approvalRequired: true, onlineRequired: false, reason: "git_merge requires approval" };
+  }
+  if (action.type === "git_rebase") {
+    return { approvalRequired: true, onlineRequired: false, reason: "git_rebase requires approval" };
+  }
+  if (action.type === "git_cherry_pick") {
+    return { approvalRequired: true, onlineRequired: false, reason: "git_cherry_pick requires approval" };
   }
   if (action.type === "git_push") {
     return { approvalRequired: true, onlineRequired: true, reason: "git_push requires approval and Online mode" };
@@ -192,6 +388,7 @@ function validateAction(action: unknown): AgentAction {
     "preview_start",
     "preview_status",
     "preview_snapshot",
+    "preview_screenshot",
     "preview_click",
     "preview_type",
     "preview_press",
@@ -199,6 +396,9 @@ function validateAction(action: unknown): AgentAction {
     "git_diff",
     "git_stage",
     "git_unstage",
+    "git_merge",
+    "git_rebase",
+    "git_cherry_pick",
     "git_commit",
     "git_push"
   ];
@@ -215,6 +415,9 @@ function validateAction(action: unknown): AgentAction {
     content: typeof candidate.content === "string" ? candidate.content : undefined,
     command: typeof candidate.command === "string" ? candidate.command : undefined,
     message: typeof candidate.message === "string" ? candidate.message : undefined,
+    branch: typeof candidate.branch === "string" ? candidate.branch : undefined,
+    upstream: typeof candidate.upstream === "string" ? candidate.upstream : undefined,
+    commit: typeof candidate.commit === "string" ? candidate.commit : undefined,
     paths: Array.isArray(candidate.paths) ? candidate.paths.filter((item): item is string => typeof item === "string") : undefined,
     staged: typeof candidate.staged === "boolean" ? candidate.staged : undefined,
     entry: typeof candidate.entry === "string" ? candidate.entry : undefined,

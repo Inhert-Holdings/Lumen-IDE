@@ -1,4 +1,12 @@
 export type Provider = "lmstudio" | "ollama" | "custom";
+export type PermissionPreset =
+  | "read_only"
+  | "local_edit_only"
+  | "local_build_mode"
+  | "preview_operator"
+  | "git_operator"
+  | "full_local_workspace"
+  | "trusted_workspace_profile";
 
 export type LlmConfig = {
   provider: Provider;
@@ -17,6 +25,8 @@ export type LlmConfig = {
   autoStopMinutes: number;
   recentModels: string[];
   helperRecentModels: string[];
+  lowResourceMode: boolean;
+  permissionPreset: PermissionPreset;
 };
 
 export type ChatMessage = {
@@ -43,6 +53,8 @@ export const LM_STUDIO_PRESET: Omit<
   | "helperRecentModels"
   | "autoManageLocalRuntime"
   | "autoStopMinutes"
+  | "lowResourceMode"
+  | "permissionPreset"
 > = {
   provider: "lmstudio",
   baseUrl: "http://localhost:1234/v1",
@@ -64,6 +76,8 @@ export const OLLAMA_PRESET: Omit<
   | "helperRecentModels"
   | "autoManageLocalRuntime"
   | "autoStopMinutes"
+  | "lowResourceMode"
+  | "permissionPreset"
 > = {
   provider: "ollama",
   baseUrl: "http://localhost:11434/v1",
@@ -85,7 +99,9 @@ export function defaultLlmConfig(): LlmConfig {
     autoManageLocalRuntime: true,
     autoStopMinutes: 10,
     recentModels: [LM_STUDIO_PRESET.model, OLLAMA_PRESET.model],
-    helperRecentModels: ["Qwen2.5-Coder-1.5B-Instruct", "qwen2.5-coder:1.5b", OLLAMA_PRESET.model]
+    helperRecentModels: ["Qwen2.5-Coder-1.5B-Instruct", "qwen2.5-coder:1.5b", OLLAMA_PRESET.model],
+    lowResourceMode: false,
+    permissionPreset: "full_local_workspace"
   };
 }
 

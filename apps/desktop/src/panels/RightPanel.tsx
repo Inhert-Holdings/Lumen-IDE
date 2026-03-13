@@ -1,11 +1,20 @@
+import { Suspense, lazy } from "react";
+
 import { Button } from "@/components/ui/button";
-import { AgentPanel } from "@/panels/AgentPanel";
-import { AuditPanel } from "@/panels/AuditPanel";
-import { GitPanel } from "@/panels/GitPanel";
-import { PreviewPanel } from "@/panels/PreviewPanel";
-import { SettingsPanel } from "@/panels/SettingsPanel";
-import { TimelinePanel } from "@/panels/TimelinePanel";
 import { useAppStore } from "@/state/useAppStore";
+
+const AgentPanel = lazy(() => import("@/panels/AgentPanel").then((module) => ({ default: module.AgentPanel })));
+const TimelinePanel = lazy(() => import("@/panels/TimelinePanel").then((module) => ({ default: module.TimelinePanel })));
+const PreviewPanel = lazy(() => import("@/panels/PreviewPanel").then((module) => ({ default: module.PreviewPanel })));
+const GitPanel = lazy(() => import("@/panels/GitPanel").then((module) => ({ default: module.GitPanel })));
+const PermissionsPanel = lazy(() =>
+  import("@/panels/PermissionsPanel").then((module) => ({ default: module.PermissionsPanel }))
+);
+const SettingsPanel = lazy(() => import("@/panels/SettingsPanel").then((module) => ({ default: module.SettingsPanel })));
+const AuditPanel = lazy(() => import("@/panels/AuditPanel").then((module) => ({ default: module.AuditPanel })));
+const DiagnosticsPanel = lazy(() =>
+  import("@/panels/DiagnosticsPanel").then((module) => ({ default: module.DiagnosticsPanel }))
+);
 
 type RightPanelProps = {
   refreshTree: () => Promise<void>;
@@ -16,7 +25,9 @@ const tabs = [
   { id: "agent", label: "Agent" },
   { id: "timeline", label: "Timeline" },
   { id: "preview", label: "Preview" },
+  { id: "diagnostics", label: "Diagnostics" },
   { id: "git", label: "Git" },
+  { id: "permissions", label: "Permissions" },
   { id: "settings", label: "Settings" },
   { id: "audit", label: "Audit" }
 ] as const;
@@ -47,12 +58,16 @@ export function RightPanel({ refreshTree, openFile }: RightPanelProps) {
       </div>
 
       <div className="min-h-0 flex-1">
-        {rightPanelTab === "agent" && <AgentPanel refreshTree={refreshTree} openFile={openFile} />}
-        {rightPanelTab === "timeline" && <TimelinePanel />}
-        {rightPanelTab === "preview" && <PreviewPanel />}
-        {rightPanelTab === "git" && <GitPanel />}
-        {rightPanelTab === "settings" && <SettingsPanel />}
-        {rightPanelTab === "audit" && <AuditPanel />}
+        <Suspense fallback={<div className="p-2 text-xs text-muted">Loading panel...</div>}>
+          {rightPanelTab === "agent" && <AgentPanel refreshTree={refreshTree} openFile={openFile} />}
+          {rightPanelTab === "timeline" && <TimelinePanel />}
+          {rightPanelTab === "preview" && <PreviewPanel />}
+          {rightPanelTab === "diagnostics" && <DiagnosticsPanel />}
+          {rightPanelTab === "git" && <GitPanel />}
+          {rightPanelTab === "permissions" && <PermissionsPanel />}
+          {rightPanelTab === "settings" && <SettingsPanel />}
+          {rightPanelTab === "audit" && <AuditPanel />}
+        </Suspense>
       </div>
     </div>
   );

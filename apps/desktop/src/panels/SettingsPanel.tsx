@@ -7,6 +7,20 @@ import { useAppStore } from "@/state/useAppStore";
 
 type ConfigTarget = "main" | "helper";
 
+const TRUST_PRESET_CAPABILITIES: Array<{
+  preset: LlmConfig["permissionPreset"];
+  label: string;
+  capabilities: string;
+}> = [
+  { preset: "read_only", label: "Read Only", capabilities: "Read/list/search + status only" },
+  { preset: "local_edit_only", label: "Local Edit Only", capabilities: "Read + propose/apply local file edits" },
+  { preset: "local_build_mode", label: "Local Build Mode", capabilities: "Edits + local commands + preview controls" },
+  { preset: "preview_operator", label: "Preview Operator", capabilities: "Preview start/connect/snapshot/click/type/press" },
+  { preset: "git_operator", label: "Git Operator", capabilities: "Git stage/unstage/commit/push (online gated)" },
+  { preset: "full_local_workspace", label: "Full Local Workspace", capabilities: "All local actions, approval-gated by risk" },
+  { preset: "trusted_workspace_profile", label: "Trusted Workspace", capabilities: "All local actions, fewer prompts except risky" }
+];
+
 export function SettingsPanel() {
   const settings = useAppStore((state) => state.settings);
   const setSettings = useAppStore((state) => state.setSettings);
@@ -69,6 +83,7 @@ export function SettingsPanel() {
     setStatus("");
     try {
       const saved = await window.lumen.settings.save(draft);
+      await window.lumen.policy.setPreset({ preset: saved.permissionPreset });
       setSettings(saved);
       setDraft(saved);
       setStatus("Saved ✅");
@@ -355,6 +370,47 @@ export function SettingsPanel() {
             <span>Online mode (OFF by default)</span>
           </label>
 
+          <label className="mt-2 block">
+            <div className="mb-1 text-muted">Trust Preset</div>
+            <select
+              className="h-8 w-full rounded border border-border bg-black/20 px-2"
+              value={draft.permissionPreset}
+              onChange={(event) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  permissionPreset: event.target.value as LlmConfig["permissionPreset"]
+                }))
+              }
+            >
+              <option value="read_only">Read Only</option>
+              <option value="local_edit_only">Local Edit Only</option>
+              <option value="local_build_mode">Local Build Mode</option>
+              <option value="preview_operator">Preview Operator</option>
+              <option value="git_operator">Git Operator</option>
+              <option value="full_local_workspace">Full Local Workspace</option>
+              <option value="trusted_workspace_profile">Trusted Workspace Profile</option>
+            </select>
+          </label>
+
+          <div className="mt-2 rounded border border-border/70 bg-black/25 p-2 text-[11px]">
+            <div className="mb-1 uppercase tracking-wide text-muted">Preset Capabilities</div>
+            <div className="space-y-1.5">
+              {TRUST_PRESET_CAPABILITIES.map((row) => (
+                <div
+                  key={row.preset}
+                  className={`rounded border px-2 py-1 ${
+                    draft.permissionPreset === row.preset
+                      ? "border-accent/50 bg-accent/10 text-text"
+                      : "border-border/70 bg-black/15 text-muted"
+                  }`}
+                >
+                  <div className="font-medium">{row.label}</div>
+                  <div>{row.capabilities}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
           <label className="mt-2 flex items-center gap-2">
             <input
               type="checkbox"
@@ -362,6 +418,21 @@ export function SettingsPanel() {
               onChange={(event) => setDraft((prev) => ({ ...prev, compactMode: event.target.checked }))}
             />
             <span>Compact mode</span>
+          </label>
+
+          <label className="mt-2 flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={draft.lowResourceMode}
+              onChange={(event) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  lowResourceMode: event.target.checked,
+                  helperEnabled: event.target.checked ? false : prev.helperEnabled
+                }))
+              }
+            />
+            <span>Low Resource Mode (disables helper + lighter polling/indexing)</span>
           </label>
 
           <label className="mt-2 flex items-center gap-2">
@@ -393,6 +464,25 @@ export function SettingsPanel() {
         <div className="flex gap-2 pt-1">
           <Button onClick={() => void save()} disabled={saving}>
             Save Settings
+          </Button>
+          <Button
+            onClick={() => {
+              void window.lumen.policy
+                .setPreset({ preset: draft.permissionPreset })
+                .then(() => setStatus(`Preset applied: ${draft.permissionPreset}`))
+                .catch((error) => setStatus(error instanceof Error ? `Failed ❌ ${error.message}` : "Failed ❌"));
+            }}
+            disabled={saving}
+          >
+            Apply Trust Preset
+          </Button>
+          <Button
+            onClick={() => {
+              void window.lumen.runtime.setLowResourceMode({ enabled: draft.lowResourceMode });
+            }}
+            disabled={saving}
+          >
+            Apply Runtime Mode
           </Button>
         </div>
 

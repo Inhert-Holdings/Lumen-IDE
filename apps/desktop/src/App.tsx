@@ -16,11 +16,19 @@ function makeId() {
   return `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
 }
 
+function agentPersistenceKey(workspaceRoot: string) {
+  const safeWorkspace = workspaceRoot.replace(/[^A-Za-z0-9_-]+/g, "_").slice(-120);
+  return `lumen.agent.memory.v2.${safeWorkspace}`;
+}
+
 export default function App() {
   const workspaceRoot = useAppStore((state) => state.workspaceRoot);
   const activeTabId = useAppStore((state) => state.activeTabId);
   const tabs = useAppStore((state) => state.tabs);
   const terminalTabs = useAppStore((state) => state.terminalTabs);
+  const taskGraph = useAppStore((state) => state.taskGraph);
+  const sessionMemory = useAppStore((state) => state.sessionMemory);
+  const agentMode = useAppStore((state) => state.agentMode);
   const settings = useAppStore((state) => state.settings);
   const explorerVisible = useAppStore((state) => state.explorerVisible);
   const terminalVisible = useAppStore((state) => state.terminalVisible);
@@ -39,6 +47,10 @@ export default function App() {
   const toggleTerminal = useAppStore((state) => state.toggleTerminal);
   const toggleCommandPalette = useAppStore((state) => state.toggleCommandPalette);
   const setTerminalTabs = useAppStore((state) => state.setTerminalTabs);
+  const setRightPanelTab = useAppStore((state) => state.setRightPanelTab);
+  const setAgentMode = useAppStore((state) => state.setAgentMode);
+  const setTaskGraph = useAppStore((state) => state.setTaskGraph);
+  const resetSessionMemory = useAppStore((state) => state.resetSessionMemory);
 
   const activeTab = tabs.find((tab) => tab.id === activeTabId) || null;
   const workspaceName = workspaceRoot ? basename(workspaceRoot) : "No Workspace";
@@ -151,6 +163,52 @@ export default function App() {
   }, [patchSessionMemory, terminalTabs]);
 
   useEffect(() => {
+    if (!workspaceRoot) return;
+    try {
+      const raw = localStorage.getItem(agentPersistenceKey(workspaceRoot));
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as {
+        taskGraph?: unknown;
+        sessionMemory?: unknown;
+        agentMode?: "manual" | "live_build";
+      };
+      if (Array.isArray(parsed.taskGraph)) {
+        setTaskGraph(parsed.taskGraph as Parameters<typeof setTaskGraph>[0]);
+      }
+      if (parsed.agentMode === "manual" || parsed.agentMode === "live_build") {
+        setAgentMode(parsed.agentMode);
+      }
+      if (parsed.sessionMemory && typeof parsed.sessionMemory === "object") {
+        const memoryPatch = parsed.sessionMemory as Partial<typeof sessionMemory>;
+        resetSessionMemory();
+        patchSessionMemory(memoryPatch);
+      }
+    } catch {
+      // Ignore corrupted persisted agent memory.
+    }
+  }, [patchSessionMemory, resetSessionMemory, setAgentMode, setTaskGraph, workspaceRoot]);
+
+  useEffect(() => {
+    if (!workspaceRoot) return;
+    const timer = window.setTimeout(() => {
+      try {
+        localStorage.setItem(
+          agentPersistenceKey(workspaceRoot),
+          JSON.stringify({
+            updatedAt: new Date().toISOString(),
+            agentMode,
+            taskGraph,
+            sessionMemory
+          })
+        );
+      } catch {
+        // Ignore local storage failures.
+      }
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [agentMode, sessionMemory, taskGraph, workspaceRoot]);
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const key = event.key.toLowerCase();
       if (event.ctrlKey && key === "p") {
@@ -186,9 +244,107 @@ export default function App() {
       { id: "save-file", label: "Save Active File", run: () => void saveActiveTab() },
       { id: "new-terminal", label: "New Terminal", run: () => void ensureTerminal().then(() => {}) },
       { id: "toggle-terminal", label: "Toggle Terminal", run: () => toggleTerminal() },
-      { id: "toggle-explorer", label: "Toggle Explorer", run: () => toggleExplorer() }
+      { id: "toggle-explorer", label: "Toggle Explorer", run: () => toggleExplorer() },
+      {
+        id: "run-current-project",
+        label: "Run Current Project",
+        run: () => {
+          setRightPanelTab("preview");
+          void window.lumen.preview.startProject({ path: "." }).catch(() => {});
+        }
+      },
+      {
+        id: "connect-preview-browser",
+        label: "Connect Preview Browser",
+        run: () => {
+          setRightPanelTab("preview");
+          void window.lumen.preview.browserConnect({}).catch(() => {});
+        }
+      },
+      {
+        id: "inspect-preview-snapshot",
+        label: "Inspect Preview Snapshot",
+        run: () => {
+          setRightPanelTab("preview");
+          void window.lumen.preview.browserSnapshot().catch(() => {});
+        }
+      },
+      {
+        id: "capture-preview-screenshot",
+        label: "Capture Preview Screenshot",
+        run: () => {
+          setRightPanelTab("preview");
+          void window.lumen.preview.browserScreenshot({ fullPage: true }).catch(() => {});
+        }
+      },
+      {
+        id: "create-verification-flow",
+        label: "Create Verification Flow",
+        run: () => {
+          setRightPanelTab("preview");
+        }
+      },
+      {
+        id: "toggle-online-mode",
+        label: "Toggle Online Mode",
+        run: () => {
+          const next = { ...useAppStore.getState().settings, onlineMode: !useAppStore.getState().settings.onlineMode };
+          void window.lumen.settings.save(next).then((saved) => setSettings(saved));
+        }
+      },
+      {
+        id: "switch-trust-preset",
+        label: "Switch Trust Preset",
+        run: () => {
+          const order = [
+            "read_only",
+            "local_edit_only",
+            "local_build_mode",
+            "preview_operator",
+            "git_operator",
+            "full_local_workspace",
+            "trusted_workspace_profile"
+          ] as const;
+          const current = useAppStore.getState().settings.permissionPreset;
+          const index = order.indexOf(current);
+          const nextPreset = order[(index + 1 + order.length) % order.length];
+          void window.lumen.policy
+            .setPreset({ preset: nextPreset })
+            .then(() => window.lumen.settings.save({ ...useAppStore.getState().settings, permissionPreset: nextPreset }))
+            .then((saved) => setSettings(saved));
+        }
+      },
+      { id: "open-permissions", label: "Open Permissions Center", run: () => setRightPanelTab("permissions") },
+      {
+        id: "start-live-build",
+        label: "Start Live Build Mode",
+        run: () => {
+          setRightPanelTab("agent");
+          setAgentMode("live_build");
+          void window.lumen.agent.setMode({ mode: "live_build" });
+        }
+      },
+      {
+        id: "stop-live-build",
+        label: "Stop Live Build Mode",
+        run: () => {
+          setAgentMode("manual");
+          void window.lumen.agent.setMode({ mode: "manual" });
+        }
+      },
+      { id: "open-timeline", label: "Open Timeline", run: () => setRightPanelTab("timeline") },
+      { id: "open-diagnostics", label: "Open Diagnostics", run: () => setRightPanelTab("diagnostics") },
+      {
+        id: "test-model-connection",
+        label: "Test Model Connection",
+        run: () => {
+          const current = useAppStore.getState().settings;
+          setRightPanelTab("settings");
+          void window.lumen.llm.test({ baseUrl: current.baseUrl, model: current.model, apiKey: current.apiKey }).catch(() => {});
+        }
+      }
     ],
-    [ensureTerminal, openFolder, saveActiveTab, toggleExplorer, toggleTerminal]
+    [ensureTerminal, openFolder, saveActiveTab, setAgentMode, setRightPanelTab, setSettings, toggleExplorer, toggleTerminal]
   );
 
   return (

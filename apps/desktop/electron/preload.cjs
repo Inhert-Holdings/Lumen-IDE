@@ -37,7 +37,21 @@ contextBridge.exposeInMainWorld("lumen", {
     stage: (payload) => ipcRenderer.invoke("git:stage", payload),
     unstage: (payload) => ipcRenderer.invoke("git:unstage", payload),
     commit: (payload) => ipcRenderer.invoke("git:commit", payload),
-    push: () => ipcRenderer.invoke("git:push")
+    push: (payload) => ipcRenderer.invoke("git:push", payload),
+    merge: (payload) => ipcRenderer.invoke("git:merge", payload),
+    rebase: (payload) => ipcRenderer.invoke("git:rebase", payload),
+    cherryPick: (payload) => ipcRenderer.invoke("git:cherryPick", payload),
+    branches: () => ipcRenderer.invoke("git:branches"),
+    checkout: (payload) => ipcRenderer.invoke("git:checkout", payload),
+    history: (payload) => ipcRenderer.invoke("git:history", payload),
+    restore: (payload) => ipcRenderer.invoke("git:restore", payload),
+    conflicts: () => ipcRenderer.invoke("git:conflicts"),
+    resolveConflict: (payload) => ipcRenderer.invoke("git:resolveConflict", payload)
+  },
+  policy: {
+    get: () => ipcRenderer.invoke("policy:get"),
+    setPreset: (payload) => ipcRenderer.invoke("policy:setPreset", payload),
+    evaluate: (payload) => ipcRenderer.invoke("policy:evaluate", payload)
   },
   settings: {
     load: () => ipcRenderer.invoke("settings:load"),
@@ -71,7 +85,9 @@ contextBridge.exposeInMainWorld("lumen", {
     }
   },
   agent: {
-    runCmd: (payload) => ipcRenderer.invoke("agent:runCmd", payload)
+    runCmd: (payload) => ipcRenderer.invoke("agent:runCmd", payload),
+    setMode: (payload) => ipcRenderer.invoke("agent:setMode", payload),
+    getTaskGraph: () => ipcRenderer.invoke("agent:getTaskGraph")
   },
   preview: {
     status: () => ipcRenderer.invoke("preview:status"),
@@ -79,11 +95,18 @@ contextBridge.exposeInMainWorld("lumen", {
     startProject: (payload) => ipcRenderer.invoke("preview:startProject", payload),
     stop: () => ipcRenderer.invoke("preview:stop"),
     browserConnect: (payload) => ipcRenderer.invoke("preview:browserConnect", payload),
-    browserSnapshot: () => ipcRenderer.invoke("preview:browserSnapshot"),
+    browserSnapshot: (payload) => ipcRenderer.invoke("preview:browserSnapshot", payload),
+    browserDiagnostics: (payload) => ipcRenderer.invoke("preview:browserDiagnostics", payload),
+    browserScreenshot: (payload) => ipcRenderer.invoke("preview:browserScreenshot", payload),
     browserClick: (payload) => ipcRenderer.invoke("preview:browserClick", payload),
     browserType: (payload) => ipcRenderer.invoke("preview:browserType", payload),
     browserPress: (payload) => ipcRenderer.invoke("preview:browserPress", payload),
+    browserPick: (payload) => ipcRenderer.invoke("preview:browserPick", payload),
     browserClose: () => ipcRenderer.invoke("preview:browserClose")
+  },
+  runtime: {
+    setLowResourceMode: (payload) => ipcRenderer.invoke("runtime:setLowResourceMode", payload),
+    getHealth: () => ipcRenderer.invoke("runtime:getHealth")
   },
   audit: {
     list: () => ipcRenderer.invoke("audit:list"),

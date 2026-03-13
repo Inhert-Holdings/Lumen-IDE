@@ -66,6 +66,16 @@ type HunkMeta = {
   preview: string;
 };
 
+type HelperTask = "terminal_summary" | "action_extraction" | "mini_plan" | "selector_candidates" | "transcript_compress";
+
+const HELPER_TASKS: HelperTask[] = [
+  "terminal_summary",
+  "action_extraction",
+  "mini_plan",
+  "selector_candidates",
+  "transcript_compress"
+];
+
 function makeId() {
   return `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
 }
@@ -362,6 +372,14 @@ function buildFastSummary(
   return `Ran ${completed}/${actions.length} actions for "${goal}". Pending changes: ${pendingCount}.${targetText}${verifyText}${extraText}`.trim();
 }
 
+function confidenceForAction(action: AgentAction): "obvious" | "likely" | "uncertain" | "risky" {
+  if (action.type === "git_push" || action.type === "git_commit") return "risky";
+  if (action.type === "write_file" || action.type === "delete_file") return "uncertain";
+  if (action.type === "run_cmd") return "likely";
+  if (action.type.startsWith("preview_")) return "likely";
+  return "obvious";
+}
+
 export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
   const workspaceRoot = useAppStore((state) => state.workspaceRoot);
   const settings = useAppStore((state) => state.settings);
@@ -382,6 +400,15 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
   const pushAppliedPatchSet = useAppStore((state) => state.pushAppliedPatchSet);
   const popAppliedPatchSet = useAppStore((state) => state.popAppliedPatchSet);
   const clearAppliedPatchHistory = useAppStore((state) => state.clearAppliedPatchHistory);
+  const agentPhase = useAppStore((state) => state.agentPhase);
+  const setAgentPhase = useAppStore((state) => state.setAgentPhase);
+  const agentMode = useAppStore((state) => state.agentMode);
+  const setAgentMode = useAppStore((state) => state.setAgentMode);
+  const taskGraph = useAppStore((state) => state.taskGraph);
+  const setTaskGraph = useAppStore((state) => state.setTaskGraph);
+  const incrementRecoveryAttempt = useAppStore((state) => state.incrementRecoveryAttempt);
+  const resetRecoveryAttempt = useAppStore((state) => state.resetRecoveryAttempt);
+  const recoveryAttempt = useAppStore((state) => state.recoveryAttempt);
   const patchSessionMemory = useAppStore((state) => state.patchSessionMemory);
 
   const [prompt, setPrompt] = useState("");
@@ -393,7 +420,6 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
   const [chatModel, setChatModel] = useState(settings.model);
   const [reasoningLevel, setReasoningLevel] = useState<ReasoningLevel>("medium");
-  const [fullAccessMode, setFullAccessMode] = useState(true);
   const [showPlan, setShowPlan] = useState(false);
   const [selectedChangeIds, setSelectedChangeIds] = useState<string[]>([]);
   const [selectedHunksByChange, setSelectedHunksByChange] = useState<Record<string, string[]>>({});
@@ -401,10 +427,24 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
 
   const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
   const resolveApprovalRef = useRef<((approved: boolean) => void) | null>(null);
+  const lastLiveHintRef = useRef("");
 
   useEffect(() => {
     setChatModel((current) => current || settings.model);
   }, [settings.model]);
+
+  useEffect(() => {
+    void window.lumen.agent.getTaskGraph().then((state) => {
+      setAgentMode(state.mode);
+      if (Array.isArray(state.taskGraph)) {
+        setTaskGraph(state.taskGraph as Parameters<typeof setTaskGraph>[0]);
+      }
+    });
+  }, [setAgentMode, setTaskGraph]);
+
+  useEffect(() => {
+    void window.lumen.agent.setMode({ mode: agentMode, taskGraph });
+  }, [agentMode, taskGraph]);
 
   useEffect(() => {
     if (!pendingChanges.length) {
@@ -435,10 +475,50 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
     setActiveChangeId((current) => (pendingChanges.some((change) => change.id === current) ? current : pendingChanges[0].id));
   }, [pendingChanges]);
 
+  useEffect(() => {
+    if (agentMode !== "live_build") return;
+    const timer = setInterval(() => {
+      if (busy) return;
+      void (async () => {
+        const status = await window.lumen.preview.status().catch(() => null);
+        if (status) {
+          patchSessionMemory({
+            activePreviewUrl: status.url || "",
+            previewMode: status.mode
+          });
+          const hint = status.browser.consoleErrors
+            ? `Preview has ${status.browser.consoleErrors} console error(s).`
+            : status.browser.networkErrors
+              ? `Preview has ${status.browser.networkErrors} network error(s).`
+              : status.running
+                ? "Preview is running cleanly."
+                : "No preview currently running.";
+          if (hint !== lastLiveHintRef.current) {
+            lastLiveHintRef.current = hint;
+            pushMessage("system", `Live Build: ${hint}`);
+          }
+        }
+
+        if (settings.permissionPreset !== "read_only") {
+          await window.lumen.agent
+            .runCmd({
+              command: "git status --short",
+              terminalId: "",
+              approved: true,
+              source: "agent",
+              preset: settings.permissionPreset
+            })
+            .catch(() => null);
+        }
+      })();
+    }, settings.lowResourceMode ? 9000 : 5000);
+    return () => clearInterval(timer);
+  }, [agentMode, busy, patchSessionMemory, settings.lowResourceMode, settings.permissionPreset]);
+
   const activeTabPath = useMemo(() => tabs.find((tab) => tab.id === activeTabId)?.path || "", [tabs, activeTabId]);
   const helperConnection = useMemo(
     () =>
-      settings.helperEnabled
+      settings.helperEnabled && !settings.lowResourceMode
         ? {
             baseUrl: (settings.helperUsesMainConnection ? settings.baseUrl : settings.helperBaseUrl).trim(),
             model: settings.helperModel.trim(),
@@ -452,7 +532,8 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
       settings.helperBaseUrl,
       settings.helperEnabled,
       settings.helperModel,
-      settings.helperUsesMainConnection
+      settings.helperUsesMainConnection,
+      settings.lowResourceMode
     ]
   );
 
@@ -474,6 +555,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
       "agent.preview_start",
       "agent.preview_status",
       "agent.preview_snapshot",
+      "agent.preview_screenshot",
       "agent.preview_click",
       "agent.preview_type",
       "agent.preview_press",
@@ -484,6 +566,14 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
       "agent.git_commit",
       "agent.git_push"
     ].includes(action);
+
+  const evaluatePolicyForAction = async (action: AgentAction) => {
+    return await window.lumen.policy.evaluate({
+      actionType: action.type,
+      command: action.command || "",
+      preset: settings.permissionPreset
+    });
+  };
 
   const toggleChangeSelection = (changeId: string) => {
     setSelectedChangeIds((current) =>
@@ -522,27 +612,64 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
   };
 
   const requestApproval = async (action: AgentAction, requirement: PermissionRequirement) => {
-    if (fullAccessMode) return true;
+    const decision = await evaluatePolicyForAction(action);
+    recordAudit({
+      id: makeId(),
+      timestamp: new Date().toISOString(),
+      action: "policy.evaluate",
+      detail: {
+        actionType: action.type,
+        allowed: decision.allowed,
+        requiresApproval: decision.requiresApproval,
+        risk: decision.risk,
+        preset: decision.preset,
+        reason: decision.reason,
+        mode: agentMode
+      }
+    });
+    if (!decision.allowed) {
+      throw new Error(decision.reason);
+    }
+    if (!decision.requiresApproval) return true;
     return await new Promise<boolean>((resolve) => {
       resolveApprovalRef.current = resolve;
-      setApproval({ action, requirement });
+      setApproval({
+        action,
+        requirement: {
+          ...requirement,
+          reason: `${requirement.reason} · ${decision.reason}`
+        }
+      });
     });
   };
 
   const streamToText = async (
     modelMessages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
-    options?: { includeReasoning?: boolean; statusLabel?: string; modelRole?: "main" | "helper" }
+    options?: {
+      includeReasoning?: boolean;
+      statusLabel?: string;
+      modelRole?: "main" | "helper";
+      helperTask?: HelperTask;
+    }
   ) => {
     const requestId = makeId();
-    const modelRole = options?.modelRole || "main";
-    const modelConfig =
-      modelRole === "helper" && helperConnection?.baseUrl && helperConnection?.model
-        ? helperConnection
-        : {
-            baseUrl: settings.baseUrl,
-            model: chatModel.trim() || settings.model,
-            apiKey: settings.apiKey
-          };
+    const requestedRole = options?.modelRole || "main";
+    if (requestedRole === "helper" && !options?.helperTask) {
+      throw new Error("Helper lane requires an explicit helper task.");
+    }
+    if (options?.helperTask && !HELPER_TASKS.includes(options.helperTask)) {
+      throw new Error(`Unsupported helper task: ${options.helperTask}`);
+    }
+
+    const canUseHelper = requestedRole === "helper" && helperConnection?.baseUrl && helperConnection?.model && !settings.lowResourceMode;
+    const modelRole = canUseHelper ? "helper" : "main";
+    const modelConfig = canUseHelper
+      ? helperConnection
+      : {
+          baseUrl: settings.baseUrl,
+          model: chatModel.trim() || settings.model,
+          apiKey: settings.apiKey
+        };
     const chosenModel = modelConfig.model;
     const includeReasoning = options?.includeReasoning !== false;
     const enhancedMessages = includeReasoning
@@ -551,6 +678,15 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
 
     return await new Promise<string>((resolve, reject) => {
       let full = "";
+      const timeoutMs = modelRole === "helper" ? 9000 : 60000;
+      const timeout = setTimeout(() => {
+        offChunk();
+        offStatus();
+        offDone();
+        offError();
+        setStreamStatus("");
+        reject(new Error(`${modelRole === "helper" ? "Helper" : "Main"} model timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
       setStreamStatus(options?.statusLabel || `Contacting ${modelRole === "helper" ? "helper" : "main"} model: ${chosenModel}`);
 
       const offChunk = window.lumen.llm.onChunk(({ requestId: chunkId, delta }) => {
@@ -567,6 +703,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
         offStatus();
         offDone();
         offError();
+        clearTimeout(timeout);
         setStreamStatus("");
         resolve(full);
       });
@@ -576,6 +713,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
         offStatus();
         offDone();
         offError();
+        clearTimeout(timeout);
         setStreamStatus("");
         reject(new Error(streamError));
       });
@@ -596,6 +734,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
           offStatus();
           offDone();
           offError();
+          clearTimeout(timeout);
           setStreamStatus("");
           reject(nextError instanceof Error ? nextError : new Error("Failed to start stream"));
         });
@@ -788,29 +927,127 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
     };
   };
 
-  const planActions = async (goal: string): Promise<AgentAction[]> => {
+  const collectPlannerContext = async (goal: string) => {
+    const [inspection, gitStatus, previewStatus, directory] = await Promise.all([
+      window.lumen.workspace.inspect({ path: "." }).catch(() => null),
+      window.lumen.git.status().catch(() => null),
+      window.lumen.preview.status().catch(() => null),
+      window.lumen.workspace.list({ path: "." }).catch(() => null)
+    ]);
+
+    const topEntries = (directory?.tree?.children || [])
+      .slice(0, settings.lowResourceMode ? 10 : 20)
+      .map((entry) => `${entry.type === "dir" ? "dir" : "file"}:${entry.name}`);
+
+    const memory = useAppStore.getState().sessionMemory;
+    return {
+      goal,
+      workspaceRoot,
+      activeTabPath,
+      lowResourceMode: settings.lowResourceMode,
+      onlineMode: settings.onlineMode,
+      trustPreset: settings.permissionPreset,
+      inspection: inspection
+        ? {
+            framework: inspection.framework,
+            runCommand: inspection.runCommand,
+            buildCommand: inspection.buildCommand,
+            scripts: inspection.scripts.map((script) => script.name),
+            devUrl: inspection.devUrl
+          }
+        : null,
+      git: gitStatus
+        ? {
+            branch: gitStatus.branch,
+            changedFiles: gitStatus.files.slice(0, 20).map((file) => file.path)
+          }
+        : null,
+      preview: previewStatus
+        ? {
+            running: previewStatus.running,
+            mode: previewStatus.mode,
+            url: previewStatus.url,
+            consoleErrors: previewStatus.browser.consoleErrors,
+            networkErrors: previewStatus.browser.networkErrors
+          }
+        : null,
+      memory: {
+        currentGoal: memory.currentGoal,
+        lastFailedCommand: memory.lastFailedCommand,
+        knownBlockers: memory.knownBlockers.slice(0, 6),
+        filesTouched: memory.filesTouched.slice(0, 12)
+      },
+      topEntries
+    };
+  };
+
+  const draftMiniPlanWithHelper = async (goal: string, context: unknown) => {
+    if (!helperConnection?.model || settings.lowResourceMode) return [];
+    try {
+      const text = await streamToText(
+        [
+          {
+            role: "system",
+            content: [
+              "You are Lumen helper planner.",
+              "Return only a JSON array of 3-8 short plan lines.",
+              'Example: ["Scope files", "Run preview", "Propose diff"]'
+            ].join("\n")
+          },
+          {
+            role: "user",
+            content: JSON.stringify({ goal, context }, null, 2)
+          }
+        ],
+        {
+          includeReasoning: false,
+          modelRole: "helper",
+          helperTask: "mini_plan",
+          statusLabel: `Helper mini-plan: ${helperConnection.model}`
+        }
+      );
+      const parsed = JSON.parse(text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, ""));
+      if (!Array.isArray(parsed)) return [];
+      return parsed.map((line) => String(line || "").trim()).filter(Boolean).slice(0, 8);
+    } catch {
+      return [];
+    }
+  };
+
+  const planActions = async (goal: string, context: unknown): Promise<AgentAction[]> => {
     const systemPrompt = [
       "You are Lumen IDE autonomous planner.",
       "Return only JSON array. No prose.",
       `Reasoning level: ${reasoningLevel}`,
       reasoningInstruction(reasoningLevel),
       `Prefer no more than ${maxPlannerActions(reasoningLevel)} actions unless strictly needed.`,
+      "Break the goal into concrete subtasks and include only executable tool actions.",
       "Allowed action types:",
-      "list_dir, read_file, search_files, write_file, delete_file, run_cmd, preview_start, preview_status, preview_snapshot, preview_click, preview_type, preview_press, git_status, git_diff, git_stage, git_unstage, git_commit, git_push",
+      "list_dir, read_file, search_files, write_file, delete_file, run_cmd, preview_start, preview_status, preview_snapshot, preview_screenshot, preview_click, preview_type, preview_press, git_status, git_diff, git_stage, git_unstage, git_commit, git_push",
       "For write_file include path and full desired content.",
       "Use preview_start to run the current project or a static workspace folder in Lumen preview.",
       "Use preview_snapshot after preview_start to inspect the page text/title.",
+      "Use preview_screenshot when visual evidence is useful.",
       "Use preview_click and preview_type with CSS selectors.",
+      "Avoid risky git actions unless user clearly asks for git commit/push.",
       "Do not use remote actions."
     ].join("\n");
 
     try {
       const text = await streamToText([
         { role: "system", content: systemPrompt },
-        { role: "user", content: goal }
+        {
+          role: "user",
+          content: [
+            `Goal:\n${goal}`,
+            "Workspace context:",
+            JSON.stringify(context, null, 2)
+          ].join("\n\n")
+        }
       ], {
         statusLabel: helperConnection?.model ? `Planning with helper model: ${helperConnection.model}` : "Planning actions...",
-        modelRole: "helper"
+        modelRole: "helper",
+        helperTask: "action_extraction"
       });
       const actions = extractActionsFromText(text).slice(0, maxPlannerActions(reasoningLevel));
       if (actions.length === 0) {
@@ -830,6 +1067,10 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
   };
 
   const executeAction = async (action: AgentAction) => {
+    const policyDecision = await evaluatePolicyForAction(action);
+    if (!policyDecision.allowed) {
+      return { ok: false, error: policyDecision.reason };
+    }
     switch (action.type) {
       case "list_dir": {
         const listed = await window.lumen.workspace.list({ path: normalizePath(workspaceRoot, action.path) });
@@ -890,7 +1131,13 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
       }
       case "run_cmd": {
         const terminalId = await ensureNamedTerminal("Agent");
-        const result = await window.lumen.agent.runCmd({ command: action.command || "", terminalId });
+        const result = await window.lumen.agent.runCmd({
+          command: action.command || "",
+          terminalId,
+          approved: true,
+          source: "agent",
+          preset: settings.permissionPreset
+        });
         if (result.code !== 0) {
           patchSessionMemory({
             lastFailedCommand: action.command || "",
@@ -908,7 +1155,10 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
             command: action.command,
             url: action.url,
             port: action.port,
-            terminalId
+            terminalId,
+            source: "agent",
+            approved: true,
+            preset: settings.permissionPreset
           });
           patchSessionMemory({
             activePreviewUrl: result.url,
@@ -919,7 +1169,11 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
           const result = await window.lumen.preview.start({
             path: action.path || ".",
             entry: action.entry || "index.html",
-            port: action.port
+            port: action.port,
+            source: "agent",
+            approved: true,
+            preset: settings.permissionPreset,
+            command: action.command
           });
           patchSessionMemory({
             activePreviewUrl: result.url,
@@ -935,36 +1189,95 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
       case "preview_snapshot": {
         const status = await window.lumen.preview.status();
         const result = status.browser.connected
-          ? await window.lumen.preview.browserSnapshot()
-          : (await window.lumen.preview.browserConnect({ url: action.url || status.url })).snapshot;
+          ? await window.lumen.preview.browserSnapshot({
+              source: "agent",
+              approved: true,
+              preset: settings.permissionPreset
+            })
+          : (
+              await window.lumen.preview.browserConnect({
+                url: action.url || status.url,
+                source: "agent",
+                approved: true,
+                preset: settings.permissionPreset
+              })
+            ).snapshot;
+        return { ok: true, output: result };
+      }
+      case "preview_screenshot": {
+        const status = await window.lumen.preview.status();
+        if (!status.browser.connected) {
+          await window.lumen.preview.browserConnect({
+            url: action.url || status.url,
+            source: "agent",
+            approved: true,
+            preset: settings.permissionPreset
+          });
+        }
+        const result = await window.lumen.preview.browserScreenshot({
+          url: action.url,
+          source: "agent",
+          approved: true,
+          preset: settings.permissionPreset
+        });
         return { ok: true, output: result };
       }
       case "preview_click": {
         const status = await window.lumen.preview.status();
         if (!status.browser.connected) {
-          await window.lumen.preview.browserConnect({ url: action.url || status.url });
+          await window.lumen.preview.browserConnect({
+            url: action.url || status.url,
+            source: "agent",
+            approved: true,
+            preset: settings.permissionPreset
+          });
         }
-        const result = await window.lumen.preview.browserClick({ selector: action.selector || "", url: action.url });
+        const result = await window.lumen.preview.browserClick({
+          selector: action.selector || "",
+          url: action.url,
+          source: "agent",
+          approved: true,
+          preset: settings.permissionPreset
+        });
         return { ok: true, output: result };
       }
       case "preview_type": {
         const status = await window.lumen.preview.status();
         if (!status.browser.connected) {
-          await window.lumen.preview.browserConnect({ url: action.url || status.url });
+          await window.lumen.preview.browserConnect({
+            url: action.url || status.url,
+            source: "agent",
+            approved: true,
+            preset: settings.permissionPreset
+          });
         }
         const result = await window.lumen.preview.browserType({
           selector: action.selector || "",
           text: action.text || "",
-          url: action.url
+          url: action.url,
+          source: "agent",
+          approved: true,
+          preset: settings.permissionPreset
         });
         return { ok: true, output: result };
       }
       case "preview_press": {
         const status = await window.lumen.preview.status();
         if (!status.browser.connected) {
-          await window.lumen.preview.browserConnect({ url: action.url || status.url });
+          await window.lumen.preview.browserConnect({
+            url: action.url || status.url,
+            source: "agent",
+            approved: true,
+            preset: settings.permissionPreset
+          });
         }
-        const result = await window.lumen.preview.browserPress({ key: action.key || "Enter", url: action.url });
+        const result = await window.lumen.preview.browserPress({
+          key: action.key || "Enter",
+          url: action.url,
+          source: "agent",
+          approved: true,
+          preset: settings.permissionPreset
+        });
         return { ok: true, output: result };
       }
       case "git_status": {
@@ -984,15 +1297,123 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
         return { ok: true, output: "unstaged" };
       }
       case "git_commit": {
-        const result = await window.lumen.git.commit({ message: action.message || "Lumen IDE commit" });
+        const result = await window.lumen.git.commit({ message: action.message || "Lumen IDE commit", approved: true });
         return { ok: true, output: result.hash };
       }
       case "git_push": {
-        await window.lumen.git.push();
+        await window.lumen.git.push({ approved: true });
         return { ok: true, output: "pushed" };
       }
       default:
         return { ok: false, error: "Unsupported action" };
+    }
+  };
+
+  const runRecoveryPolicies = async (
+    failedActions: Array<{ action: AgentAction; result: { ok: boolean; error?: string; output?: unknown } }>
+  ) => {
+    if (!failedActions.length) return;
+    setAgentPhase("recover");
+    incrementRecoveryAttempt();
+
+    for (const failed of failedActions) {
+      const rawFailure = `${failed.result.error || ""}\n${String(failed.result.output || "")}`.trim();
+      const errorText = rawFailure.toLowerCase();
+
+      if (helperConnection?.model && !settings.lowResourceMode) {
+        try {
+          const helperSummary = await streamToText(
+            [
+              {
+                role: "system",
+                content: [
+                  "You are Lumen helper runtime analyzer.",
+                  "Return max 4 concise bullet lines.",
+                  "Focus on root cause and next local command."
+                ].join("\n")
+              },
+              {
+                role: "user",
+                content: rawFailure.slice(0, 10000)
+              }
+            ],
+            {
+              includeReasoning: false,
+              modelRole: "helper",
+              helperTask: "terminal_summary",
+              statusLabel: `Helper failure summary: ${helperConnection.model}`
+            }
+          );
+          if (helperSummary.trim()) {
+            pushMessage("system", `Recovery summary:\n${helperSummary.trim()}`);
+          }
+        } catch {
+          // Helper summaries are best-effort and should never block recovery.
+        }
+      }
+
+      if (errorText.includes("no runnable project script")) {
+        const inspect = await executeAction({ type: "read_file", path: normalizePath(workspaceRoot, "package.json"), reason: "Recovery: inspect scripts" });
+        if (inspect.ok) {
+          pushMessage("system", "Recovery: inspected package.json scripts to refine next run command.");
+        }
+        continue;
+      }
+
+      const fileLineMatch = rawFailure.match(/([A-Za-z]:\\[^:\n\r]+|\.[\\/][^:\n\r]+|\b[\w./\\-]+\.(?:ts|tsx|js|jsx|py|rs|go|java)):(\d+)(?::(\d+))?/);
+      if (fileLineMatch?.[1]) {
+        const candidatePath = normalizePath(workspaceRoot, fileLineMatch[1]);
+        const lineNumber = Number(fileLineMatch[2] || 0);
+        try {
+          const snippet = await window.lumen.workspace.read({ path: candidatePath });
+          const lines = snippet.content.split(/\r?\n/);
+          const start = Math.max(0, lineNumber - 3);
+          const end = Math.min(lines.length, lineNumber + 2);
+          const context = lines
+            .slice(start, end)
+            .map((line, index) => `${start + index + 1}: ${line}`)
+            .join("\n");
+          pushMessage("system", `Recovery: localized compile error near ${fileLabel(candidatePath)}:${lineNumber}\n${context}`);
+          patchSessionMemory({
+            knownBlockers: [`Compile error near ${candidatePath}:${lineNumber}`]
+          });
+        } catch {
+          // Ignore snippet failures.
+        }
+      }
+
+      if (errorText.includes("eaddrinuse") || errorText.includes("address already in use")) {
+        const cmdAction: AgentAction = {
+          type: "run_cmd",
+          command: "netstat -ano | findstr LISTENING",
+          reason: "Recovery: inspect port conflicts"
+        };
+        const approved = await requestApproval(cmdAction, permissionForAction(cmdAction));
+        if (approved) {
+          await executeAction(cmdAction);
+          pushMessage("system", "Recovery: checked listening ports for conflicts.");
+        }
+        continue;
+      }
+
+      if (errorText.includes("cannot find module") || errorText.includes("command not found") || errorText.includes("is not recognized")) {
+        const installAction: AgentAction = {
+          type: "run_cmd",
+          command: "pnpm install",
+          reason: "Recovery: install missing dependencies"
+        };
+        const approved = await requestApproval(installAction, permissionForAction(installAction));
+        if (approved) {
+          const installResult = await executeAction(installAction);
+          if (installResult.ok) {
+            pushMessage("system", "Recovery: dependency install completed.");
+          }
+        }
+      }
+
+      if (useAppStore.getState().pendingChanges.length > 0 && useAppStore.getState().recoveryAttempt >= 2) {
+        pushMessage("system", "Recovery: repeated failures detected. Consider rolling back the latest applied patch set before retry.");
+      }
     }
   };
 
@@ -1002,6 +1423,8 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
 
     setBusy(true);
     setError("");
+    setAgentPhase("understand");
+    resetRecoveryAttempt();
     pushMessage("user", goal);
     setPrompt("");
     patchSessionMemory({
@@ -1022,9 +1445,12 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
     );
 
     try {
+      setAgentPhase("scope");
       if (shouldUseDirectEditPath(goal)) {
+        setAgentPhase("plan");
         const fastEdit = await proposeDirectEdit(goal);
         if (fastEdit) {
+          setAgentPhase("propose");
           const pendingList = [
             {
               id: fastEdit.pendingChange.id,
@@ -1060,6 +1486,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
           let verifyResult: { ok: boolean; output?: unknown; error?: string } | null = null;
           const shouldVerify = shouldRunVerify(reasoningLevel, goal, pendingList.length);
           if (shouldVerify) {
+            setAgentPhase("verify");
             const verifyAction: AgentAction = {
               type: "run_cmd",
               command: "pnpm test --if-present",
@@ -1098,12 +1525,30 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
               model: chatModel.trim() || settings.model
             }
           );
+          setAgentPhase("summarize");
           return;
         }
       }
 
-      let actions = await planActions(goal);
+      setAgentPhase("plan");
+      const plannerContext = await collectPlannerContext(goal);
+      const helperMiniPlan = await draftMiniPlanWithHelper(goal, plannerContext);
+      if (helperMiniPlan.length) {
+        setPlanLines(helperMiniPlan);
+      }
+      let actions = await planActions(goal, plannerContext);
+      const initialTaskGraph = actions.map((action, index) => ({
+        id: `${index + 1}`,
+        title: `${action.type}${action.path ? ` · ${fileLabel(action.path)}` : ""}`,
+        phase: "execute" as const,
+        status: "pending" as const,
+        confidence: confidenceForAction(action),
+        dependsOn: index ? [`${index}`] : [],
+        detail: action.reason || ""
+      }));
+      setTaskGraph(initialTaskGraph);
 
+      setAgentPhase("execute");
       let loopResult = await runAutonomousLoop({
         goal,
         actions,
@@ -1122,8 +1567,22 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
       });
 
       if (isBuildIntent(goal) && loopResult.pendingChanges.length === 0) {
+        setAgentPhase("recover");
+        incrementRecoveryAttempt();
         pushMessage("system", "Planner produced no file changes. Switching to scaffold build mode.");
         actions = await buildScaffoldActions(goal);
+        setTaskGraph(
+          actions.map((action, index) => ({
+            id: `${index + 1}`,
+            title: `${action.type}${action.path ? ` · ${fileLabel(action.path)}` : ""}`,
+            phase: "execute",
+            status: "pending",
+            confidence: confidenceForAction(action),
+            dependsOn: index ? [`${index}`] : [],
+            detail: action.reason || ""
+          }))
+        );
+        setAgentPhase("execute");
         loopResult = await runAutonomousLoop({
           goal,
           actions,
@@ -1145,6 +1604,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
       let verifyResult = loopResult.verifyResult;
       const shouldVerify = shouldRunVerify(reasoningLevel, goal, loopResult.pendingChanges.length);
       if (shouldVerify) {
+        setAgentPhase("verify");
         const verifyAction: AgentAction = {
           type: "run_cmd",
           command: "pnpm test --if-present",
@@ -1189,6 +1649,7 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
         : loopResult.pendingChanges;
 
       const failedActions = loopResult.actionResults.filter((item) => !item.result.ok && !item.skipped);
+      await runRecoveryPolicies(failedActions);
       const failedCommand = failedActions.find((item) => item.action.type === "run_cmd")?.action.command || "";
       patchSessionMemory({
         filesTouched: allPendingChanges.map((change) => change.path),
@@ -1199,6 +1660,11 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
       });
 
       setPlanLines(loopResult.plan);
+      setTaskGraph((useAppStore.getState().taskGraph || []).map((node, index) => ({
+        ...node,
+        status: loopResult.actionResults[index]?.result.ok ? "done" : loopResult.actionResults[index]?.skipped ? "blocked" : "failed"
+      })));
+      setAgentPhase("propose");
       setPendingChanges(
         allPendingChanges.map((change) => ({
           id: change.id,
@@ -1223,9 +1689,12 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
         reasoning: reasoningLevel,
         model: chatModel.trim() || settings.model
       });
+      setAgentPhase("summarize");
     } catch (nextError) {
       const message = nextError instanceof Error ? nextError.message : "Agent run failed";
       setError(message);
+      setAgentPhase("recover");
+      incrementRecoveryAttempt();
       patchSessionMemory({
         verificationStatus: "failed",
         knownBlockers: [message]
@@ -1281,13 +1750,45 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
     if (!selectedPendingChanges.length) return;
     if (!selectedChangeCountWithHunks) return;
     if (!window.confirm(`Apply ${selectedChangeCountWithHunks} selected change(s)?`)) return;
+    setAgentPhase("apply");
 
     const nextPending: typeof pendingChanges = [];
     const appliedChanges: typeof pendingChanges = [];
+    const conflictPaths: string[] = [];
 
     for (const change of pendingChanges) {
       if (!selectedChangeIds.includes(change.id)) {
         nextPending.push(change);
+        continue;
+      }
+
+      let liveContent = "";
+      let liveExists = true;
+      try {
+        liveContent = (await window.lumen.workspace.read({ path: change.path })).content;
+      } catch {
+        liveContent = "";
+        liveExists = false;
+      }
+
+      if (!liveExists && change.type === "delete") {
+        appliedChanges.push({
+          ...change,
+          nextContent: "",
+          diff: buildDiff(change.path, change.previousContent, "")
+        });
+        continue;
+      }
+
+      if (liveContent !== change.previousContent) {
+        const targetContent = change.type === "delete" ? "" : change.nextContent;
+        nextPending.push({
+          ...change,
+          previousContent: liveContent,
+          existedBefore: liveExists,
+          diff: buildDiff(change.path, liveContent, targetContent)
+        });
+        conflictPaths.push(change.path);
         continue;
       }
 
@@ -1315,9 +1816,20 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
 
       if (applyTarget !== change.previousContent) {
         if (change.type === "delete" && applyTarget === "") {
-          await window.lumen.workspace.delete({ path: change.path });
+          await window.lumen.workspace.delete({
+            path: change.path,
+            source: "agent_apply",
+            approved: true,
+            preset: settings.permissionPreset
+          });
         } else {
-          await window.lumen.workspace.write({ path: change.path, content: applyTarget });
+          await window.lumen.workspace.write({
+            path: change.path,
+            content: applyTarget,
+            source: "agent_apply",
+            approved: true,
+            preset: settings.permissionPreset
+          });
         }
         appliedChanges.push({
           ...change,
@@ -1361,6 +1873,23 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
         source: "agent"
       })
     );
+    if (conflictPaths.length) {
+      appendTimeline(
+        createTimelineEntry({
+          phase: "apply",
+          status: "blocked",
+          title: "Apply conflicts detected",
+          detail: `${conflictPaths.length} file(s) changed since proposal and were kept pending`,
+          source: "agent"
+        })
+      );
+      pushMessage(
+        "system",
+        `Skipped ${conflictPaths.length} change(s) because files changed since proposal: ${conflictPaths
+          .map(fileLabel)
+          .join(", ")}. Review refreshed diffs before applying.`
+      );
+    }
     pushMessage(
       "system",
       `Applied ${appliedChanges.length} change(s). ${nextPending.length ? `${nextPending.length} proposal(s) still pending.` : ""}`.trim()
@@ -1370,17 +1899,35 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
   const rollbackLastApply = async () => {
     if (!latestAppliedPatchSet) return;
     if (!window.confirm(`Rollback ${latestAppliedPatchSet.changes.length} applied change(s)?`)) return;
+    setAgentPhase("recover");
 
     for (const change of latestAppliedPatchSet.changes) {
       if (change.type === "delete") {
-        await window.lumen.workspace.write({ path: change.path, content: change.previousContent });
+        await window.lumen.workspace.write({
+          path: change.path,
+          content: change.previousContent,
+          source: "agent_apply",
+          approved: true,
+          preset: settings.permissionPreset
+        });
         continue;
       }
 
       if (change.existedBefore) {
-        await window.lumen.workspace.write({ path: change.path, content: change.previousContent });
+        await window.lumen.workspace.write({
+          path: change.path,
+          content: change.previousContent,
+          source: "agent_apply",
+          approved: true,
+          preset: settings.permissionPreset
+        });
       } else {
-        await window.lumen.workspace.delete({ path: change.path });
+        await window.lumen.workspace.delete({
+          path: change.path,
+          source: "agent_apply",
+          approved: true,
+          preset: settings.permissionPreset
+        });
       }
     }
 
@@ -1422,6 +1969,18 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
           Main: {chatModel.trim() || settings.model}
           {helperConnection?.model ? ` · Helper: ${helperConnection.model}` : ""}
         </div>
+        <div className="mb-2 flex flex-wrap items-center gap-1.5 text-[10px]">
+          {(["understand", "scope", "plan", "execute", "verify", "recover", "propose", "apply", "summarize"] as const).map((phase) => (
+            <span
+              key={phase}
+              className={`rounded border px-1.5 py-0.5 uppercase ${
+                agentPhase === phase ? "border-accent text-accent bg-accent/10" : "border-border text-muted"
+              }`}
+            >
+              {phase}
+            </span>
+          ))}
+        </div>
         <div className="grid grid-cols-2 gap-2 text-[11px]">
           <label className="block">
             <div className="mb-1 text-muted">Chat Model</div>
@@ -1452,14 +2011,22 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
           </label>
         </div>
         <div className="mt-2 flex items-center gap-3 text-[11px]">
-          <label className="flex items-center gap-1.5">
-            <input type="checkbox" checked={fullAccessMode} onChange={(event) => setFullAccessMode(event.target.checked)} />
-            <span>Full Access Mode (auto-approve)</span>
-          </label>
+          <span className="rounded border border-border px-2 py-1 text-[10px] uppercase text-muted">
+            Trust: {settings.permissionPreset.replace(/_/g, " ")}
+          </span>
+          <Button
+            onClick={() => {
+              const nextMode = agentMode === "live_build" ? "manual" : "live_build";
+              setAgentMode(nextMode);
+            }}
+          >
+            {agentMode === "live_build" ? "Stop Live Build" : "Start Live Build"}
+          </Button>
           <label className="flex items-center gap-1.5">
             <input type="checkbox" checked={showPlan} onChange={(event) => setShowPlan(event.target.checked)} />
             <span>Show Plan</span>
           </label>
+          <span className="text-muted">Recoveries: {recoveryAttempt}</span>
         </div>
       </div>
 
@@ -1513,6 +2080,23 @@ export function AgentPanel({ refreshTree, openFile }: AgentPanelProps) {
                 <li key={line}>{line}</li>
               ))}
             </ol>
+          </div>
+        )}
+
+        {taskGraph.length > 0 && (
+          <div className="mb-2 rounded border border-border bg-black/20 p-2 text-[11px]">
+            <div className="mb-1 text-[10px] uppercase text-muted">Task Graph</div>
+            <div className="space-y-1">
+              {taskGraph.map((node) => (
+                <div key={node.id} className="flex items-center justify-between gap-2 rounded border border-border/50 px-2 py-1">
+                  <div className="min-w-0 truncate">{node.id}. {node.title}</div>
+                  <div className="flex items-center gap-1">
+                    <span className="rounded border border-border px-1.5 py-0.5 text-[10px] text-muted">{node.confidence}</span>
+                    <span className="rounded border border-border px-1.5 py-0.5 text-[10px] uppercase text-muted">{node.status}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
         )}
 

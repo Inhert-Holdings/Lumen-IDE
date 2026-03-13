@@ -15,13 +15,24 @@ const WORKSPACE_FILE = "lumen-workspace.json";
 const AUDIT_FILE = "lumen-audit.jsonl";
 const MANAGED_MODELS_DIR = "ollama-models";
 const MODEL_MANIFEST_RELATIVE = path.join("manifests", "registry.ollama.ai", "library", "qwen2.5-coder", "7b");
+const PREVIEW_SCREENSHOT_DIR = "preview-screenshots";
 const MAX_TREE_ENTRIES = 6000;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const PREVIEW_DEFAULT_PORT = 4173;
 const PREVIEW_MAX_PORT_ATTEMPTS = 25;
 const PREVIEW_PROJECT_WAIT_MS = 30000;
 const PREVIEW_DIAGNOSTIC_LIMIT = 40;
+const PREVIEW_EVENT_LIMIT = 120;
 const EXCLUDED_DIRS = new Set([".git", "node_modules", "dist", "release", ".idea", ".vscode"]);
+const POLICY_PRESETS = new Set([
+  "read_only",
+  "local_edit_only",
+  "local_build_mode",
+  "preview_operator",
+  "git_operator",
+  "full_local_workspace",
+  "trusted_workspace_profile"
+]);
 
 const DEFAULT_SETTINGS = {
   provider: "ollama",
@@ -39,7 +50,9 @@ const DEFAULT_SETTINGS = {
   apiKey: "",
   helperApiKey: "",
   autoManageLocalRuntime: true,
-  autoStopMinutes: 10
+  autoStopMinutes: 10,
+  lowResourceMode: false,
+  permissionPreset: "full_local_workspace"
 };
 
 let workspaceRoot = APP_ROOT;
@@ -53,6 +66,10 @@ let lastRuntimeActivityAt = 0;
 let previewRuntime = null;
 let previewProjectRuntime = null;
 let previewBrowserRuntime = null;
+const agentRuntimeState = {
+  mode: "manual",
+  taskGraph: []
+};
 
 function getUserDataPath(filename) {
   return path.join(app.getPath("userData"), filename);
@@ -180,7 +197,9 @@ function saveSettings(input) {
     ...input,
     autoStopMinutes: Math.max(1, Number(input.autoStopMinutes) || DEFAULT_SETTINGS.autoStopMinutes),
     recentModels: Array.from(new Set([input.model, ...(input.recentModels || [])].filter(Boolean))).slice(0, 10),
-    helperRecentModels: Array.from(new Set([input.helperModel, ...(input.helperRecentModels || [])].filter(Boolean))).slice(0, 10)
+    helperRecentModels: Array.from(new Set([input.helperModel, ...(input.helperRecentModels || [])].filter(Boolean))).slice(0, 10),
+    lowResourceMode: Boolean(input.lowResourceMode),
+    permissionPreset: normalizePolicyPreset(input.permissionPreset)
   };
   const persisted = {
     ...next,
@@ -202,7 +221,9 @@ function saveSettings(input) {
     model: next.model,
     helperEnabled: next.helperEnabled,
     helperModel: next.helperModel,
-    onlineMode: next.onlineMode
+    onlineMode: next.onlineMode,
+    lowResourceMode: next.lowResourceMode,
+    permissionPreset: next.permissionPreset
   });
   return next;
 }
@@ -220,12 +241,20 @@ function safeResolve(target) {
   return resolved;
 }
 
-function listDirectoryTree(basePath, maxDepth = 5) {
+function getWorkspaceScanLimits() {
+  const settings = loadSettings();
+  if (settings.lowResourceMode) {
+    return { maxTreeEntries: 2000, maxDepth: 3 };
+  }
+  return { maxTreeEntries: MAX_TREE_ENTRIES, maxDepth: 5 };
+}
+
+function listDirectoryTree(basePath, maxDepth = 5, maxTreeEntries = MAX_TREE_ENTRIES) {
   const counter = { value: 0 };
 
   function walk(currentPath, depth) {
     const name = path.basename(currentPath);
-    if (counter.value >= MAX_TREE_ENTRIES) {
+    if (counter.value >= maxTreeEntries) {
       return { name, path: currentPath, type: "dir", children: [], truncated: true };
     }
 
@@ -250,7 +279,7 @@ function listDirectoryTree(basePath, maxDepth = 5) {
         return a.name.localeCompare(b.name);
       })
       .forEach((entry) => {
-        if (counter.value >= MAX_TREE_ENTRIES) {
+        if (counter.value >= maxTreeEntries) {
           node.truncated = true;
           return;
         }
@@ -270,11 +299,14 @@ function listDirectoryTree(basePath, maxDepth = 5) {
 }
 
 function searchFiles(query, maxResults = 100) {
+  const settings = loadSettings();
+  const cappedResults = settings.lowResourceMode ? Math.min(maxResults || 60, 60) : maxResults;
+  const maxDepth = settings.lowResourceMode ? 5 : 8;
   const results = [];
   const needle = query.toLowerCase();
 
   function walk(currentPath, depth = 0) {
-    if (results.length >= maxResults || depth > 8) return;
+    if (results.length >= cappedResults || depth > maxDepth) return;
 
     let entries = [];
     try {
@@ -292,7 +324,7 @@ function searchFiles(query, maxResults = 100) {
         const lower = entry.name.toLowerCase();
         if (lower.includes(needle)) {
           results.push({ path: entryPath, line: 0, preview: "filename match" });
-          if (results.length >= maxResults) return;
+          if (results.length >= cappedResults) return;
           continue;
         }
         try {
@@ -303,7 +335,7 @@ function searchFiles(query, maxResults = 100) {
             const end = Math.min(content.length, lineIndex + 120);
             results.push({ path: entryPath, line: 0, preview: content.slice(start, end).replace(/\s+/g, " ") });
           }
-          if (results.length >= maxResults) return;
+          if (results.length >= cappedResults) return;
         } catch {
           // Skip binary/unreadable files.
         }
@@ -313,16 +345,17 @@ function searchFiles(query, maxResults = 100) {
 
   if (!query) return [];
   walk(workspaceRoot);
-  audit("files.search", { query, count: results.length });
+  audit("files.search", { query, count: results.length, lowResourceMode: settings.lowResourceMode });
   return results;
 }
 
 function listDir(targetPath) {
   const basePath = targetPath ? safeResolve(targetPath) : workspaceRoot;
+  const limits = getWorkspaceScanLimits();
   audit("files.list", { basePath });
   return {
     root: workspaceRoot,
-    tree: listDirectoryTree(basePath)
+    tree: listDirectoryTree(basePath, limits.maxDepth, limits.maxTreeEntries)
   };
 }
 
@@ -336,7 +369,28 @@ function readFile(filePath) {
   return { path: target, content };
 }
 
-function writeFile(filePath, content) {
+function writeFile(filePath, content, options = {}) {
+  if (options.source === "agent_apply") {
+    const decision = evaluatePolicyDecision({
+      actionType: "write_file",
+      preset: options.preset
+    });
+    audit("policy.decision", {
+      actionType: "write_file",
+      allowed: decision.allowed,
+      requiresApproval: decision.requiresApproval,
+      risk: decision.risk,
+      preset: decision.preset,
+      source: "agent_apply",
+      mode: agentRuntimeState.mode
+    });
+    if (!decision.allowed) {
+      throw new Error(decision.reason);
+    }
+    if (decision.requiresApproval && !options.approved) {
+      throw new Error("write_file requires explicit approval by policy.");
+    }
+  }
   const target = safeResolve(filePath);
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, content, "utf8");
@@ -368,7 +422,28 @@ function renamePath(sourcePath, destinationPath) {
   return { ok: true };
 }
 
-function deletePath(targetPath) {
+function deletePath(targetPath, options = {}) {
+  if (options.source === "agent_apply") {
+    const decision = evaluatePolicyDecision({
+      actionType: "delete_file",
+      preset: options.preset
+    });
+    audit("policy.decision", {
+      actionType: "delete_file",
+      allowed: decision.allowed,
+      requiresApproval: decision.requiresApproval,
+      risk: decision.risk,
+      preset: decision.preset,
+      source: "agent_apply",
+      mode: agentRuntimeState.mode
+    });
+    if (!decision.allowed) {
+      throw new Error(decision.reason);
+    }
+    if (decision.requiresApproval && !options.approved) {
+      throw new Error("delete_file requires explicit approval by policy.");
+    }
+  }
   const target = safeResolve(targetPath);
   fs.rmSync(target, { recursive: true, force: true });
   audit("files.delete", { path: target });
@@ -966,6 +1041,8 @@ function appendTerminalOutput(record, chunk) {
 
 async function waitForPreviewUrlInTerminal(record, preferredUrl, timeoutMs = PREVIEW_PROJECT_WAIT_MS) {
   const startedAt = Date.now();
+  const settings = loadSettings();
+  const pollMs = settings.lowResourceMode ? 1000 : 500;
   let lastError = "";
   let currentUrl = normalizeLocalPreviewUrl(preferredUrl);
 
@@ -996,7 +1073,7 @@ async function waitForPreviewUrlInTerminal(record, preferredUrl, timeoutMs = PRE
           lastError = error instanceof Error ? error.message : "Preview URL did not respond";
         }
       }
-      await sleep(500);
+      await sleep(pollMs);
     }
   } finally {
     record.collectors.delete(onData);
@@ -1040,6 +1117,13 @@ function pushPreviewDiagnostic(target, value) {
   }
 }
 
+function pushPreviewEvent(target, value, limit = PREVIEW_EVENT_LIMIT) {
+  target.push(value);
+  if (target.length > limit) {
+    target.splice(0, target.length - limit);
+  }
+}
+
 async function ensurePreviewBrowser() {
   if (previewBrowserRuntime?.browser) {
     return previewBrowserRuntime;
@@ -1067,23 +1151,66 @@ async function ensurePreviewBrowser() {
     title: "",
     executable: executablePath,
     consoleErrors: [],
-    networkErrors: []
+    networkErrors: [],
+    consoleEvents: [],
+    networkEvents: []
   };
 
   page.on("console", (message) => {
-    if (message.type() === "error" && previewBrowserRuntime?.page === page) {
-      pushPreviewDiagnostic(previewBrowserRuntime.consoleErrors, message.text());
+    if (previewBrowserRuntime?.page !== page) return;
+    const text = message.text();
+    const entry = {
+      type: message.type(),
+      text,
+      location: message.location(),
+      at: new Date().toISOString()
+    };
+    pushPreviewEvent(previewBrowserRuntime.consoleEvents, entry);
+    if (message.type() === "error") {
+      pushPreviewDiagnostic(previewBrowserRuntime.consoleErrors, text);
     }
   });
   page.on("pageerror", (error) => {
     if (previewBrowserRuntime?.page === page) {
+      pushPreviewEvent(previewBrowserRuntime.consoleEvents, {
+        type: "pageerror",
+        text: error.message,
+        location: null,
+        at: new Date().toISOString()
+      });
       pushPreviewDiagnostic(previewBrowserRuntime.consoleErrors, error.message);
     }
   });
   page.on("requestfailed", (request) => {
     if (previewBrowserRuntime?.page === page) {
       const failure = request.failure()?.errorText || "request failed";
+      pushPreviewEvent(previewBrowserRuntime.networkEvents, {
+        type: "requestfailed",
+        url: request.url(),
+        method: request.method(),
+        status: 0,
+        ok: false,
+        error: failure,
+        at: new Date().toISOString()
+      });
       pushPreviewDiagnostic(previewBrowserRuntime.networkErrors, `${request.method()} ${request.url()} (${failure})`);
+    }
+  });
+  page.on("response", (response) => {
+    if (previewBrowserRuntime?.page !== page) return;
+    const status = response.status();
+    const entry = {
+      type: "response",
+      url: response.url(),
+      method: response.request().method(),
+      status,
+      ok: status >= 200 && status < 400,
+      error: status >= 400 ? `HTTP ${status}` : "",
+      at: new Date().toISOString()
+    };
+    pushPreviewEvent(previewBrowserRuntime.networkEvents, entry);
+    if (status >= 400) {
+      pushPreviewDiagnostic(previewBrowserRuntime.networkErrors, `${entry.method} ${entry.url} (HTTP ${status})`);
     }
   });
 
@@ -1121,6 +1248,8 @@ async function connectPreviewBrowser(targetUrl = "") {
   const runtime = await ensurePreviewBrowser();
   runtime.consoleErrors = [];
   runtime.networkErrors = [];
+  runtime.consoleEvents = [];
+  runtime.networkEvents = [];
   await runtime.page.goto(url, { waitUntil: "domcontentloaded" });
   runtime.url = url;
   runtime.title = await runtime.page.title();
@@ -1140,6 +1269,85 @@ async function snapshotPreviewBrowser() {
     url: runtime.url,
     title,
     text
+  };
+}
+
+function normalizeScreenshotFileName(inputName) {
+  const value = String(inputName || "").trim();
+  if (!value) return "";
+  const base = path.basename(value).replace(/[^A-Za-z0-9._-]/g, "-");
+  if (!base) return "";
+  return base.toLowerCase().endsWith(".png") ? base : `${base}.png`;
+}
+
+async function screenshotPreviewBrowser(payload = {}) {
+  const runtime = previewBrowserRuntime?.page ? previewBrowserRuntime : await connectPreviewBrowser(payload.url || "");
+  const screenshotDir = getUserDataPath(PREVIEW_SCREENSHOT_DIR);
+  fs.mkdirSync(screenshotDir, { recursive: true });
+
+  const requestedName = normalizeScreenshotFileName(payload.fileName || "");
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const fileName = requestedName || `preview-${stamp}.png`;
+  const targetPath = path.join(screenshotDir, fileName);
+
+  await runtime.page.screenshot({
+    path: targetPath,
+    fullPage: Boolean(payload.fullPage)
+  });
+  runtime.title = await runtime.page.title();
+  audit("preview.browser_screenshot", {
+    path: targetPath,
+    url: runtime.url,
+    fullPage: Boolean(payload.fullPage)
+  });
+  return {
+    path: targetPath,
+    url: runtime.url,
+    title: runtime.title
+  };
+}
+
+async function readPreviewDomSummary(runtime) {
+  return await runtime.page.evaluate(() => {
+    const headings = Array.from(document.querySelectorAll("h1,h2,h3"))
+      .map((node) => node.textContent?.trim() || "")
+      .filter(Boolean)
+      .slice(0, 12);
+    const links = document.querySelectorAll("a[href]").length;
+    const buttons = document.querySelectorAll("button").length;
+    const inputs = document.querySelectorAll("input,textarea,select").length;
+    const forms = document.querySelectorAll("form").length;
+    const interactive = document.querySelectorAll("a[href],button,input,textarea,select,[role='button']").length;
+    const textSample = (document.body?.innerText || "").replace(/\s+\n/g, "\n").trim().slice(0, 2000);
+    return {
+      url: location.href,
+      title: document.title || "",
+      headings,
+      counts: {
+        links,
+        buttons,
+        inputs,
+        forms,
+        interactive
+      },
+      textSample
+    };
+  });
+}
+
+async function getPreviewBrowserDiagnostics(payload = {}) {
+  const runtime = previewBrowserRuntime?.page ? previewBrowserRuntime : await connectPreviewBrowser(payload.url || "");
+  const limit = Math.min(Math.max(Number(payload.limit) || 60, 10), 200);
+  const includeDom = payload.includeDom !== false;
+  const domSummary = includeDom ? await readPreviewDomSummary(runtime) : null;
+  runtime.title = await runtime.page.title();
+
+  return {
+    url: runtime.url,
+    title: runtime.title,
+    consoleEvents: (runtime.consoleEvents || []).slice(-limit),
+    networkEvents: (runtime.networkEvents || []).slice(-limit),
+    domSummary
   };
 }
 
@@ -1171,6 +1379,81 @@ async function pressPreviewBrowser(payload = {}) {
   runtime.title = await runtime.page.title();
   audit("preview.browser_press", { key, url: runtime.url });
   return snapshotPreviewBrowser();
+}
+
+async function pickPreviewBrowserSelector(payload = {}) {
+  const runtime = previewBrowserRuntime?.page ? previewBrowserRuntime : await connectPreviewBrowser(payload.url || "");
+  const ratioX = Number(payload.ratioX);
+  const ratioY = Number(payload.ratioY);
+  if (!Number.isFinite(ratioX) || !Number.isFinite(ratioY)) {
+    throw new Error("Selector picker requires ratioX and ratioY.");
+  }
+  if (ratioX < 0 || ratioX > 1 || ratioY < 0 || ratioY > 1) {
+    throw new Error("Selector picker ratios must be between 0 and 1.");
+  }
+
+  const result = await runtime.page.evaluate(({ ratioX: xRatio, ratioY: yRatio }) => {
+    function cssSelector(node) {
+      if (!node || !(node instanceof Element)) return "";
+      if (node.id) return `#${CSS.escape(node.id)}`;
+      const segments = [];
+      let current = node;
+      while (current && current.nodeType === 1 && segments.length < 6) {
+        const tag = current.tagName.toLowerCase();
+        let segment = tag;
+        if (current.classList?.length) {
+          const classNames = Array.from(current.classList).filter(Boolean).slice(0, 2);
+          if (classNames.length) {
+            segment += `.${classNames.map((name) => CSS.escape(name)).join(".")}`;
+          }
+        }
+        const parent = current.parentElement;
+        if (parent) {
+          const siblings = Array.from(parent.children).filter((child) => child.tagName === current.tagName);
+          if (siblings.length > 1) {
+            const index = siblings.indexOf(current) + 1;
+            segment += `:nth-of-type(${index})`;
+          }
+        }
+        segments.unshift(segment);
+        if (tag === "body") break;
+        current = parent;
+      }
+      return segments.join(" > ");
+    }
+
+    const viewportWidth = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0, 1);
+    const viewportHeight = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0, 1);
+    const x = Math.max(0, Math.min(viewportWidth - 1, Math.round(viewportWidth * xRatio)));
+    const y = Math.max(0, Math.min(viewportHeight - 1, Math.round(viewportHeight * yRatio)));
+    const element = document.elementFromPoint(x, y);
+    if (!element) {
+      return { selector: "", tag: "", text: "", x, y, ratioX: xRatio, ratioY: yRatio };
+    }
+    const selector = cssSelector(element);
+    return {
+      selector,
+      tag: element.tagName.toLowerCase(),
+      text: (element.textContent || "").replace(/\s+/g, " ").trim().slice(0, 140),
+      x,
+      y,
+      ratioX: xRatio,
+      ratioY: yRatio
+    };
+  }, { ratioX, ratioY });
+
+  if (!result?.selector) {
+    throw new Error("No element selector could be derived at that point.");
+  }
+  audit("preview.browser_pick_selector", {
+    selector: result.selector,
+    x: result.x,
+    y: result.y,
+    ratioX: result.ratioX,
+    ratioY: result.ratioY,
+    url: runtime.url
+  });
+  return result;
 }
 
 function getPreviewStatus() {
@@ -1414,6 +1697,209 @@ function assertRemoteAllowed(baseUrl) {
   if (!settings.onlineMode) {
     throw new Error("Online mode is disabled. Enable it in Settings first.");
   }
+}
+
+function isReadOnlyCommand(command) {
+  const normalized = String(command || "").trim().toLowerCase();
+  if (!normalized) return true;
+  const allowlist = [
+    /^dir$/,
+    /^ls(\s|$)/,
+    /^pwd$/,
+    /^git\s+status(\s|$)/,
+    /^git\s+diff(\s|$)/,
+    /^git\s+log(\s|$)/,
+    /^cat(\s|$)/,
+    /^type(\s|$)/,
+    /^rg(\s|$)/,
+    /^findstr(\s|$)/,
+    /^echo(\s|$)/,
+    /^whoami$/,
+    /^get-childitem(\s|$)/i,
+    /^get-content(\s|$)/i
+  ];
+  return allowlist.some((pattern) => pattern.test(normalized));
+}
+
+function normalizePolicyPreset(value) {
+  const preset = String(value || "").trim();
+  return POLICY_PRESETS.has(preset) ? preset : DEFAULT_SETTINGS.permissionPreset;
+}
+
+function riskForActionType(actionType, command = "") {
+  if (
+    actionType === "git_push" ||
+    actionType === "git_commit" ||
+    actionType === "git_merge" ||
+    actionType === "git_rebase" ||
+    actionType === "git_cherry_pick"
+  ) {
+    return "risky";
+  }
+  if (actionType === "write_file" || actionType === "delete_file") return "uncertain";
+  if (actionType === "run_cmd") {
+    return isReadOnlyCommand(command || "") ? "likely" : "risky";
+  }
+  if (["preview_click", "preview_type", "preview_press", "preview_start", "preview_screenshot"].includes(actionType)) {
+    return "likely";
+  }
+  return "obvious";
+}
+
+function presetAllowsActionType(preset, actionType) {
+  const readActions = new Set([
+    "list_dir",
+    "read_file",
+    "search_files",
+    "git_status",
+    "git_diff",
+    "preview_status",
+    "preview_snapshot",
+    "preview_screenshot"
+  ]);
+  const editActions = new Set(["write_file", "delete_file"]);
+  const previewActions = new Set(["preview_start", "preview_click", "preview_type", "preview_press"]);
+  const gitActions = new Set([
+    "git_stage",
+    "git_unstage",
+    "git_merge",
+    "git_rebase",
+    "git_cherry_pick",
+    "git_commit",
+    "git_push"
+  ]);
+
+  if (preset === "read_only") return readActions.has(actionType);
+  if (preset === "local_edit_only") return readActions.has(actionType) || editActions.has(actionType);
+  if (preset === "preview_operator") return readActions.has(actionType) || previewActions.has(actionType);
+  if (preset === "git_operator") return readActions.has(actionType) || gitActions.has(actionType);
+  if (preset === "local_build_mode") {
+    return (
+      readActions.has(actionType) ||
+      editActions.has(actionType) ||
+      previewActions.has(actionType) ||
+      actionType === "run_cmd" ||
+      actionType === "git_stage" ||
+      actionType === "git_unstage"
+    );
+  }
+  return true;
+}
+
+function evaluatePolicyDecision(payload = {}) {
+  const settings = loadSettings();
+  const preset = normalizePolicyPreset(payload.preset || settings.permissionPreset);
+  const actionType = String(payload.actionType || "").trim();
+  const command = String(payload.command || "");
+  const risk = riskForActionType(actionType, command);
+  if (actionType === "git_push" && !settings.onlineMode) {
+    return {
+      preset,
+      actionType,
+      risk,
+      allowed: false,
+      requiresApproval: false,
+      reason: "Online mode is disabled."
+    };
+  }
+
+  const allowed = presetAllowsActionType(preset, actionType);
+  if (!allowed) {
+    return {
+      preset,
+      actionType,
+      risk,
+      allowed: false,
+      requiresApproval: false,
+      reason: `Action ${actionType} blocked by ${preset} preset.`
+    };
+  }
+
+  const requiresApproval = preset === "trusted_workspace_profile" ? risk === "risky" : risk === "uncertain" || risk === "risky";
+  return {
+    preset,
+    actionType,
+    risk,
+    allowed: true,
+    requiresApproval,
+    reason: requiresApproval ? `Requires approval (${risk} risk).` : `Allowed (${risk} risk).`
+  };
+}
+
+function enforceAgentPolicy(payload, actionType, command = "") {
+  if (String(payload?.source || "").trim() !== "agent") return;
+  const decision = evaluatePolicyDecision({
+    actionType,
+    command,
+    preset: payload?.preset || ""
+  });
+  audit("policy.decision", {
+    actionType,
+    allowed: decision.allowed,
+    requiresApproval: decision.requiresApproval,
+    risk: decision.risk,
+    preset: decision.preset,
+    source: "agent",
+    mode: agentRuntimeState.mode
+  });
+  if (!decision.allowed) {
+    throw new Error(decision.reason);
+  }
+  if (decision.requiresApproval && !payload?.approved) {
+    throw new Error(`${actionType} requires explicit approval by policy.`);
+  }
+}
+
+function getPolicyState() {
+  const settings = loadSettings();
+  return {
+    preset: normalizePolicyPreset(settings.permissionPreset),
+    presets: Array.from(POLICY_PRESETS)
+  };
+}
+
+function setPolicyPreset(nextPreset) {
+  const settings = loadSettings();
+  const preset = normalizePolicyPreset(nextPreset);
+  saveSettings({
+    ...settings,
+    permissionPreset: preset
+  });
+  audit("policy.set_preset", { preset });
+  return getPolicyState();
+}
+
+function getRuntimeHealth() {
+  const settings = loadSettings();
+  return {
+    lowResourceMode: Boolean(settings.lowResourceMode),
+    managedRuntime: {
+      active: Boolean(managedRuntime?.process && !managedRuntime.process.killed),
+      name: managedRuntime?.name || "",
+      modelsPath: managedRuntime?.modelsPath || ""
+    },
+    preview: {
+      staticRunning: Boolean(previewRuntime),
+      projectRunning: Boolean(previewProjectRuntime),
+      browserConnected: Boolean(previewBrowserRuntime?.page)
+    },
+    process: {
+      pid: process.pid,
+      uptimeSec: Math.round(process.uptime()),
+      memoryRss: process.memoryUsage().rss
+    }
+  };
+}
+
+function setLowResourceMode(enabled) {
+  const settings = loadSettings();
+  const next = saveSettings({
+    ...settings,
+    lowResourceMode: Boolean(enabled),
+    helperEnabled: enabled ? false : settings.helperEnabled
+  });
+  audit("runtime.low_resource_mode", { enabled: next.lowResourceMode, helperEnabled: next.helperEnabled });
+  return getRuntimeHealth();
 }
 
 function buildLlmHeaders(config) {
@@ -2160,6 +2646,29 @@ function disallowUnsafeCommand(command) {
 
 async function runCommand(command, options = {}) {
   disallowUnsafeCommand(command);
+  if (options.source === "agent") {
+    const decision = evaluatePolicyDecision({
+      actionType: "run_cmd",
+      command,
+      preset: options.preset
+    });
+    audit("policy.decision", {
+      actionType: "run_cmd",
+      command,
+      allowed: decision.allowed,
+      requiresApproval: decision.requiresApproval,
+      risk: decision.risk,
+      preset: decision.preset,
+      source: "agent",
+      mode: agentRuntimeState.mode
+    });
+    if (!decision.allowed) {
+      throw new Error(decision.reason);
+    }
+    if (decision.requiresApproval && !options.approved) {
+      throw new Error("run_cmd requires explicit approval by policy.");
+    }
+  }
   audit("agent.run_cmd", { command, terminalId: options.terminalId || "" });
 
   if (options.terminalId) {
@@ -2248,7 +2757,29 @@ async function gitUnstage(paths) {
   return { ok: true };
 }
 
-async function gitCommit(message) {
+function enforceGitPolicy(actionType, options = {}) {
+  const decision = evaluatePolicyDecision({
+    actionType,
+    preset: options?.preset || ""
+  });
+  audit("policy.decision", {
+    actionType,
+    allowed: decision.allowed,
+    requiresApproval: decision.requiresApproval,
+    risk: decision.risk,
+    preset: decision.preset,
+    source: "git"
+  });
+  if (!decision.allowed) {
+    throw new Error(decision.reason);
+  }
+  if (decision.requiresApproval && !options.approved) {
+    throw new Error(`${actionType} requires explicit approval by policy.`);
+  }
+}
+
+async function gitCommit(message, options = {}) {
+  enforceGitPolicy("git_commit", options);
   const { git, isRepo } = await getGit();
   if (!isRepo) throw new Error("Not a git repository.");
   const result = await git.commit(message);
@@ -2256,7 +2787,8 @@ async function gitCommit(message) {
   return { ok: true, hash: result.commit };
 }
 
-async function gitPush() {
+async function gitPush(options = {}) {
+  enforceGitPolicy("git_push", options);
   const settings = loadSettings();
   if (!settings.onlineMode) {
     throw new Error("Online mode is disabled. Enable it before pushing.");
@@ -2266,6 +2798,187 @@ async function gitPush() {
   await git.push();
   audit("git.push", { ok: true });
   return { ok: true };
+}
+
+async function gitMerge(payload = {}) {
+  const branch = String(payload.branch || "").trim();
+  if (!branch) throw new Error("Merge target branch is required.");
+  enforceGitPolicy("git_merge", payload);
+
+  const { git, isRepo } = await getGit();
+  if (!isRepo) throw new Error("Not a git repository.");
+  const result = await git.merge([branch]);
+  audit("git.merge", {
+    branch,
+    summary: result?.summary || null
+  });
+  return {
+    ok: true,
+    branch,
+    summary: result?.summary || null
+  };
+}
+
+async function gitRebase(payload = {}) {
+  const upstream = String(payload.upstream || "").trim();
+  if (!upstream) throw new Error("Rebase upstream branch is required.");
+  enforceGitPolicy("git_rebase", payload);
+
+  const { git, isRepo } = await getGit();
+  if (!isRepo) throw new Error("Not a git repository.");
+  const output = await git.raw(["rebase", upstream]);
+  audit("git.rebase", { upstream });
+  return {
+    ok: true,
+    upstream,
+    output: String(output || "").slice(-4000)
+  };
+}
+
+async function gitCherryPick(payload = {}) {
+  const commit = String(payload.commit || "").trim();
+  if (!commit) throw new Error("Cherry-pick commit hash is required.");
+  enforceGitPolicy("git_cherry_pick", payload);
+
+  const { git, isRepo } = await getGit();
+  if (!isRepo) throw new Error("Not a git repository.");
+  const output = await git.raw(["cherry-pick", commit]);
+  audit("git.cherry_pick", { commit });
+  return {
+    ok: true,
+    commit,
+    output: String(output || "").slice(-4000)
+  };
+}
+
+async function gitBranches() {
+  const { git, isRepo } = await getGit();
+  if (!isRepo) return { isRepo: false, current: "", branches: [] };
+
+  const local = await git.branchLocal();
+  const remoteRaw = await git.raw(["branch", "-r"]);
+  const remote = remoteRaw
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(/^\*\s*/, ""))
+    .filter((line) => line && !line.includes("->"));
+
+  const branches = [
+    ...local.all.map((name) => ({
+      name,
+      current: name === local.current,
+      remote: false
+    })),
+    ...remote
+      .filter((name) => !local.all.includes(name))
+      .map((name) => ({
+        name,
+        current: false,
+        remote: true
+      }))
+  ];
+
+  audit("git.branches", { current: local.current, count: branches.length });
+  return {
+    isRepo: true,
+    current: local.current,
+    branches
+  };
+}
+
+async function gitCheckoutBranch(payload = {}) {
+  const name = String(payload.name || "").trim();
+  if (!name) throw new Error("Branch name is required.");
+
+  const { git, isRepo } = await getGit();
+  if (!isRepo) throw new Error("Not a git repository.");
+
+  if (payload.create) {
+    await git.checkoutLocalBranch(name);
+  } else {
+    await git.checkout(name);
+  }
+  audit("git.checkout", { name, create: Boolean(payload.create) });
+  return { ok: true, current: name };
+}
+
+async function gitHistory(limit = 25) {
+  const { git, isRepo } = await getGit();
+  if (!isRepo) return { isRepo: false, commits: [] };
+
+  const maxCount = Math.min(Math.max(Number(limit) || 25, 1), 100);
+  const log = await git.log({ maxCount });
+  const commits = log.all.map((item) => ({
+    hash: item.hash,
+    shortHash: item.hash.slice(0, 8),
+    message: item.message,
+    author: item.author_name,
+    date: item.date
+  }));
+  audit("git.history", { count: commits.length });
+  return { isRepo: true, commits };
+}
+
+async function gitRestore(paths = [], options = {}) {
+  const list = Array.isArray(paths) ? paths.filter(Boolean) : [];
+  if (!list.length) throw new Error("At least one file path is required for restore.");
+
+  const { git, isRepo } = await getGit();
+  if (!isRepo) throw new Error("Not a git repository.");
+
+  const restoreWorking = options?.workingTree !== false;
+  const restoreStaged = Boolean(options?.staged);
+  if (!restoreWorking && !restoreStaged) {
+    throw new Error("Restore requires staged or workingTree target.");
+  }
+
+  if (restoreStaged) {
+    await git.reset(["HEAD", "--", ...list]);
+  }
+  if (restoreWorking) {
+    await git.checkout(["--", ...list]);
+  }
+  audit("git.restore", { paths: list, staged: restoreStaged, workingTree: restoreWorking });
+  return { ok: true };
+}
+
+async function gitConflicts() {
+  const { git, isRepo } = await getGit();
+  if (!isRepo) return { isRepo: false, hasConflicts: false, files: [], hints: [] };
+
+  const status = await git.status();
+  const conflictSet = new Set(status.conflicted || []);
+  for (const file of status.files) {
+    if (String(file.index || "").includes("U") || String(file.working_dir || "").includes("U")) {
+      conflictSet.add(file.path);
+    }
+  }
+  const files = Array.from(conflictSet);
+  const hints = files.length
+    ? [
+        "Open conflicted files and resolve markers.",
+        "Use Use Ours / Use Theirs for quick resolution.",
+        "Stage resolved files and commit."
+      ]
+    : [];
+  audit("git.conflicts", { files: files.length });
+  return { isRepo: true, hasConflicts: files.length > 0, files, hints };
+}
+
+async function gitResolveConflict(payload = {}) {
+  const filePath = String(payload.path || "").trim();
+  const strategy = String(payload.strategy || "").trim().toLowerCase();
+  if (!filePath) throw new Error("Conflict path is required.");
+  if (!["ours", "theirs"].includes(strategy)) {
+    throw new Error("Conflict strategy must be 'ours' or 'theirs'.");
+  }
+
+  const { git, isRepo } = await getGit();
+  if (!isRepo) throw new Error("Not a git repository.");
+
+  await git.raw(["checkout", `--${strategy}`, "--", filePath]);
+  await git.add([filePath]);
+  audit("git.resolve_conflict", { path: filePath, strategy });
+  return { ok: true, path: filePath, strategy };
 }
 
 async function createWindow() {
@@ -2319,11 +3032,11 @@ ipcMain.handle("files:list", async (_event, payload) => {
   return listDir(payload?.path);
 });
 ipcMain.handle("files:read", async (_event, payload) => readFile(payload.path));
-ipcMain.handle("files:write", async (_event, payload) => writeFile(payload.path, payload.content));
+ipcMain.handle("files:write", async (_event, payload) => writeFile(payload.path, payload.content, payload));
 ipcMain.handle("files:create", async (_event, payload) => createFile(payload.path));
 ipcMain.handle("files:mkdir", async (_event, payload) => createDirectory(payload.path));
 ipcMain.handle("files:rename", async (_event, payload) => renamePath(payload.path, payload.nextPath));
-ipcMain.handle("files:delete", async (_event, payload) => deletePath(payload.path));
+ipcMain.handle("files:delete", async (_event, payload) => deletePath(payload.path, payload));
 ipcMain.handle("files:search", async (_event, payload) => ({ results: searchFiles(payload.query, payload.maxResults) }));
 ipcMain.handle("workspace:inspect", async (_event, payload) => inspectProject(payload || {}));
 
@@ -2341,6 +3054,20 @@ ipcMain.handle("terminal:kill", async (_event, payload) => killTerminal(payload.
 
 ipcMain.handle("settings:load", async () => loadSettings());
 ipcMain.handle("settings:save", async (_event, payload) => saveSettings(payload));
+ipcMain.handle("policy:get", async () => getPolicyState());
+ipcMain.handle("policy:setPreset", async (_event, payload) => setPolicyPreset(payload?.preset));
+ipcMain.handle("policy:evaluate", async (_event, payload) => {
+  const decision = evaluatePolicyDecision(payload || {});
+  audit("policy.evaluate", {
+    actionType: payload?.actionType || "",
+    allowed: decision.allowed,
+    requiresApproval: decision.requiresApproval,
+    risk: decision.risk,
+    preset: decision.preset,
+    mode: agentRuntimeState.mode
+  });
+  return decision;
+});
 
 ipcMain.handle("llm:test", async (_event, payload) => testLlmConnection(payload));
 ipcMain.handle("llm:listModels", async (_event, payload) => listLlmModels(payload));
@@ -2351,24 +3078,100 @@ ipcMain.handle("llm:startStream", async (event, payload) => {
 });
 ipcMain.handle("llm:abortStream", async (_event, payload) => stopLlmStream(payload.requestId));
 
-ipcMain.handle("agent:runCmd", async (_event, payload) => runCommand(payload.command, { terminalId: payload?.terminalId || "" }));
+ipcMain.handle("agent:setMode", async (_event, payload) => {
+  const nextMode = String(payload?.mode || "").trim() === "live_build" ? "live_build" : "manual";
+  agentRuntimeState.mode = nextMode;
+  if (Array.isArray(payload?.taskGraph)) {
+    agentRuntimeState.taskGraph = payload.taskGraph;
+  }
+  audit("agent.mode", { mode: agentRuntimeState.mode });
+  return { mode: agentRuntimeState.mode };
+});
+ipcMain.handle("agent:getTaskGraph", async () => ({
+  mode: agentRuntimeState.mode,
+  taskGraph: agentRuntimeState.taskGraph
+}));
+ipcMain.handle("agent:runCmd", async (_event, payload) =>
+  runCommand(payload.command, {
+    terminalId: payload?.terminalId || "",
+    approved: Boolean(payload?.approved),
+    source: payload?.source || "agent",
+    preset: payload?.preset || ""
+  })
+);
 ipcMain.handle("preview:status", async () => getPreviewStatus());
-ipcMain.handle("preview:start", async (_event, payload) => startPreviewServer(payload || {}));
-ipcMain.handle("preview:startProject", async (_event, payload) => startPreviewProject(payload || {}));
+ipcMain.handle("preview:start", async (_event, payload) => {
+  const normalized = payload || {};
+  enforceAgentPolicy(normalized, "preview_start", normalized.command || "");
+  return startPreviewServer(normalized);
+});
+ipcMain.handle("preview:startProject", async (_event, payload) => {
+  const normalized = payload || {};
+  enforceAgentPolicy(normalized, "preview_start", normalized.command || "");
+  return startPreviewProject(normalized);
+});
 ipcMain.handle("preview:stop", async () => stopPreview("manual"));
-ipcMain.handle("preview:browserConnect", async (_event, payload) => connectPreviewBrowser(payload?.url || ""));
-ipcMain.handle("preview:browserSnapshot", async () => snapshotPreviewBrowser());
-ipcMain.handle("preview:browserClick", async (_event, payload) => clickPreviewBrowser(payload || {}));
-ipcMain.handle("preview:browserType", async (_event, payload) => typePreviewBrowser(payload || {}));
-ipcMain.handle("preview:browserPress", async (_event, payload) => pressPreviewBrowser(payload || {}));
+ipcMain.handle("preview:browserConnect", async (_event, payload) => {
+  const normalized = payload || {};
+  enforceAgentPolicy(normalized, "preview_snapshot");
+  return connectPreviewBrowser(normalized.url || "");
+});
+ipcMain.handle("preview:browserSnapshot", async (_event, payload) => {
+  const normalized = payload || {};
+  enforceAgentPolicy(normalized, "preview_snapshot");
+  return snapshotPreviewBrowser();
+});
+ipcMain.handle("preview:browserDiagnostics", async (_event, payload) => {
+  const normalized = payload || {};
+  enforceAgentPolicy(normalized, "preview_snapshot");
+  return getPreviewBrowserDiagnostics(normalized);
+});
+ipcMain.handle("preview:browserScreenshot", async (_event, payload) => {
+  const normalized = payload || {};
+  enforceAgentPolicy(normalized, "preview_screenshot");
+  return screenshotPreviewBrowser(normalized);
+});
+ipcMain.handle("preview:browserClick", async (_event, payload) => {
+  const normalized = payload || {};
+  enforceAgentPolicy(normalized, "preview_click");
+  return clickPreviewBrowser(normalized);
+});
+ipcMain.handle("preview:browserType", async (_event, payload) => {
+  const normalized = payload || {};
+  enforceAgentPolicy(normalized, "preview_type");
+  return typePreviewBrowser(normalized);
+});
+ipcMain.handle("preview:browserPress", async (_event, payload) => {
+  const normalized = payload || {};
+  enforceAgentPolicy(normalized, "preview_press");
+  return pressPreviewBrowser(normalized);
+});
+ipcMain.handle("preview:browserPick", async (_event, payload) => {
+  const normalized = payload || {};
+  enforceAgentPolicy(normalized, "preview_click");
+  return pickPreviewBrowserSelector(normalized);
+});
 ipcMain.handle("preview:browserClose", async () => closePreviewBrowser("manual"));
+ipcMain.handle("runtime:setLowResourceMode", async (_event, payload) => setLowResourceMode(Boolean(payload?.enabled)));
+ipcMain.handle("runtime:getHealth", async () => getRuntimeHealth());
 
 ipcMain.handle("git:status", async () => gitStatus());
 ipcMain.handle("git:diff", async (_event, payload) => gitDiff(payload?.path || "", Boolean(payload?.staged)));
 ipcMain.handle("git:stage", async (_event, payload) => gitStage(payload.paths));
 ipcMain.handle("git:unstage", async (_event, payload) => gitUnstage(payload.paths));
-ipcMain.handle("git:commit", async (_event, payload) => gitCommit(payload.message));
-ipcMain.handle("git:push", async () => gitPush());
+ipcMain.handle("git:commit", async (_event, payload) => gitCommit(payload.message, { approved: Boolean(payload?.approved ?? true) }));
+ipcMain.handle("git:push", async (_event, payload) => gitPush({ approved: Boolean(payload?.approved ?? true) }));
+ipcMain.handle("git:merge", async (_event, payload) => gitMerge({ ...(payload || {}), approved: Boolean(payload?.approved ?? true) }));
+ipcMain.handle("git:rebase", async (_event, payload) => gitRebase({ ...(payload || {}), approved: Boolean(payload?.approved ?? true) }));
+ipcMain.handle("git:cherryPick", async (_event, payload) =>
+  gitCherryPick({ ...(payload || {}), approved: Boolean(payload?.approved ?? true) })
+);
+ipcMain.handle("git:branches", async () => gitBranches());
+ipcMain.handle("git:checkout", async (_event, payload) => gitCheckoutBranch(payload || {}));
+ipcMain.handle("git:history", async (_event, payload) => gitHistory(payload?.limit));
+ipcMain.handle("git:restore", async (_event, payload) => gitRestore(payload?.paths || [], payload || {}));
+ipcMain.handle("git:conflicts", async () => gitConflicts());
+ipcMain.handle("git:resolveConflict", async (_event, payload) => gitResolveConflict(payload || {}));
 
 ipcMain.handle("audit:list", async () => ({ entries: loadAudit() }));
 ipcMain.handle("audit:clear", async () => {
